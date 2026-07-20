@@ -26,7 +26,7 @@ Or use the umbrella crate:
 
 ```toml
 [dependencies]
-gamma = { git = "https://github.com/your-org/gamma" }
+gamma = { git = "https://github.com/Far-Beyond-Pulsar/gamma" }
 ```
 
 ### Example
