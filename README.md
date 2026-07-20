@@ -155,6 +155,108 @@ The crossover scales with subscriber count: 4 subs need ≈4 µs, 16 subs ≈1 �
 | Concurrent publish, 8 threads | **120 M / sec** | Thread scheduling |
 | Parallel dispatch (rayon), 8 subs, 10 µs work | **190 M ops / sec** | CPU cores |
 
+## Case study: Instance‑level events (Unreal‑style)
+
+Unreal Engine has two levels of event dispatch:
+
+| Level | Example | How |
+|---|---|---|
+| **Global / system** | `Tick`, `BeginPlay` | A central dispatcher fires to all registered actors |
+| **Per‑instance / object** | `OnActorHit`, `OnComponentBeginOverlap` | Fires only on the specific actor/component that was hit |
+
+Gamma models this with a single type — [`EventBus`] — used at different
+ownership levels:
+
+### Global events → a central `EventBus`
+
+Built‑in engine events that any system can subscribe to.
+
+```rust
+// Anywhere in the engine — subscribe to the global Tick event
+let mut global_events = EventBus::new();
+
+global_events.subscribe(|_: &Tick| {
+    // called every frame
+});
+```
+
+### Per‑instance events → each actor owns its own `EventBus`
+
+This matches Unreal's approach: every `UObject` carries its own delegate map.
+Subscribers are scoped to that specific instance — no central routing needed.
+
+```rust
+use gamma_core::EventBus;
+use gamma_derive::pulsar_event;
+
+#[pulsar_event]
+struct OnDied {
+    killer: u32,
+    damage: f32,
+}
+
+struct Monster {
+    events: EventBus,
+    health: f32,
+}
+
+impl Monster {
+    pub fn new() -> Self {
+        Self { events: EventBus::new(), health: 100.0 }
+    }
+
+    /// Let external code react when *this* monster dies.
+    pub fn on_died<F: Fn(&OnDied) + 'static>(&mut self, f: F) {
+        self.events.subscribe(f);
+    }
+
+    pub fn take_damage(&self, killer: u32, amount: f32) {
+        // … apply damage, check death …
+        self.events.publish(OnDied { killer, damage: amount });
+    }
+}
+
+let mut goblin = Monster::new();
+
+// Subscribe to *this specific goblin's* death.
+goblin.on_died(|e: &OnDied| {
+    println!("Goblin killed by {} ({})", e.killer, e.damage);
+});
+
+// Fire the event on the goblin.
+goblin.take_damage(7, 100.0);
+```
+
+### Thread‑safe actors
+
+For actors shared across threads, use [`SyncEventBus`]:
+
+```rust
+use std::sync::Arc;
+use gamma_core::SyncEventBus;
+
+struct SharedMonster {
+    events: SyncEventBus,
+}
+
+let monster = Arc::new(SharedMonster { events: SyncEventBus::new() });
+let m2 = Arc::clone(&monster);
+
+std::thread::spawn(move || {
+    m2.events.publish(OnDied { killer: 1, damage: 50.0 });
+});
+```
+
+### Global vs instance — when to use each
+
+| You want to… | Use |
+|---|---|
+| Fire a frame‑tick event | Single shared [`EventBus`] |
+| Log / analytics for *every* player death | Single shared [`EventBus`] |
+| React when a *specific* NPC dies | NPC's own [`EventBus`] field |
+| Handle a collision on a particular physics body | Body's own [`EventBus`] field |
+| Cross‑module communication (plugin → host) | Single shared [`EventBus`] |
+
 ## Why not just use `TypeId`?
 
 `TypeId::of::<T>()` is **not** stable across compilation units. Two separate

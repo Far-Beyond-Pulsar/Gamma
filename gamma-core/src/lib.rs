@@ -4,6 +4,9 @@
 //! plugin-compatible event bus designed to work across FFI boundaries
 //! (e.g., between a host and dynamically loaded libraries).
 //!
+//! For per‑instance events (each actor owns its own [`EventBus`]), see the
+//! [case study](https://github.com/Far-Beyond-Pulsar/gamma#readme).
+//!
 //! # DLL / Plugin Safety
 //!
 //! Every event type **must**:
@@ -284,6 +287,10 @@ impl Default for SyncEventBus {
         Self::new()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -888,4 +895,5 @@ mod tests {
         let bus: EventBus = Default::default();
         bus.publish(EmptyEvent);
     }
+
 }
