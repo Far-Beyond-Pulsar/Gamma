@@ -1,3 +1,7 @@
+<p align="center">
+    <img width="300" src="https://raw.githubusercontent.com/Far-Beyond-Pulsar/Gamma/refs/heads/main/assets/Gamma.png">
+</p>
+
 # Pulsar Gamma
 
 A **DLL‑safe, data‑driven event system** for Rust plugin architectures.
