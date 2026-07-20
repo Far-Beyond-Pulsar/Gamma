@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["gamma-core", "gamma-derive"]
+
+[package]
+name = "gamma"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Pulsar Gamma — a DLL-safe, data-driven event system for Rust plugin architectures"
+
+[dependencies]
+gamma-core = { path = "gamma-core" }
+gamma-derive = { path = "gamma-derive" }

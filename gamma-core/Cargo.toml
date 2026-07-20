@@ -1,0 +1,11 @@
+[package]
+name = "gamma-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Core runtime for the Gamma event system — Event trait, EventBus, and FFI-safe dispatch"
+
+[dependencies]
+
+[dev-dependencies]
+gamma-derive = { path = "../gamma-derive" }
