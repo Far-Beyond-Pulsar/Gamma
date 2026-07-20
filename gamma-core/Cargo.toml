@@ -6,6 +6,17 @@ rust-version = "1.85"
 description = "Core runtime for the Gamma event system — Event trait, EventBus, and FFI-safe dispatch"
 
 [dependencies]
+rustc-hash = "2"
+rayon = { version = "1", optional = true }
+
+[features]
+default = []
+parallel = ["rayon"]
 
 [dev-dependencies]
 gamma-derive = { path = "../gamma-derive" }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "throughput"
+harness = false

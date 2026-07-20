@@ -36,7 +36,9 @@
 //! ```
 
 use std::any::Any;
-use std::collections::HashMap;
+use std::sync::RwLock;
+
+use rustc_hash::FxHashMap;
 
 // ---------------------------------------------------------------------------
 // Event trait
@@ -110,14 +112,14 @@ impl<T: 'static, F: Fn(&T)> EventHandler for CallbackWrapper<T, F> {
 /// plugins) have subscribed to, provided all event types use `#[repr(C)]`
 /// and both sides share a global allocator.
 pub struct EventBus {
-    subscribers: HashMap<u64, Vec<Box<dyn EventHandler>>>,
+    subscribers: FxHashMap<u64, Vec<Box<dyn EventHandler>>>,
 }
 
 impl EventBus {
     /// Create an empty event bus.
     pub fn new() -> Self {
         Self {
-            subscribers: HashMap::new(),
+            subscribers: FxHashMap::default(),
         }
     }
 
@@ -177,6 +179,107 @@ impl EventBus {
 }
 
 impl Default for EventBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SyncEventBus — thread-safe variant
+// ---------------------------------------------------------------------------
+
+/// A thread-safe event bus that can be shared across threads via [`Arc`].
+///
+/// `SyncEventBus` wraps all internal state in a [`RwLock`] so that both
+/// [`subscribe`] and [`publish`] take only `&self`.  Subscribers must be
+/// `Send + Sync`.
+///
+/// The [`parallel_publish`] method dispatches to all subscribers using
+/// scoped threads, enabling parallel processing of expensive handlers.
+///
+/// [`subscribe`]: SyncEventBus::subscribe
+/// [`publish`]: SyncEventBus::publish
+/// [`parallel_publish`]: SyncEventBus::parallel_publish
+/// [`Arc`]: std::sync::Arc
+pub struct SyncEventBus {
+    subscribers: RwLock<FxHashMap<u64, Vec<Box<dyn EventHandler + Send + Sync>>>>,
+}
+
+impl SyncEventBus {
+    /// Create an empty, thread-safe event bus.
+    pub fn new() -> Self {
+        Self {
+            subscribers: RwLock::new(FxHashMap::default()),
+        }
+    }
+
+    /// Register a callback for events of type `T`.
+    ///
+    /// The closure must be `Send + Sync` so the bus can be shared across
+    /// threads safely.
+    pub fn subscribe<T: Event + Send + Sync, F>(&self, callback: F)
+    where
+        F: Fn(&T) + Send + Sync + 'static,
+    {
+        self.subscribers
+            .write()
+            .unwrap()
+            .entry(T::stable_type_id())
+            .or_default()
+            .push(Box::new(CallbackWrapper {
+                callback,
+                _marker: std::marker::PhantomData,
+            }));
+    }
+
+    /// Publish an event to all registered subscribers (sequential).
+    ///
+    /// Acquires a read lock and invokes each subscriber in order.
+    pub fn publish<T: Event>(&self, event: T) {
+        let id = T::stable_type_id();
+        if let Some(listeners) = self.subscribers.read().unwrap().get(&id) {
+            for listener in listeners {
+                listener.handle(&event);
+            }
+        }
+    }
+
+    /// Publish an event and dispatch to subscribers **in parallel**.
+    ///
+    /// When the `parallel` feature is enabled (requires `rayon`), dispatch
+    /// uses a global work‑stealing thread pool — threads stay warm between
+    /// calls, making this viable for handlers as cheap as ~1 µs.
+    /// Without the feature, falls back to `std::thread::scope`.
+    ///
+    /// The event type must be [`Sync`] because `&event` is shared across
+    /// threads.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any spawned thread panics.
+    pub fn parallel_publish<T: Event + Sync>(&self, event: T) {
+        let id = T::stable_type_id();
+        if let Some(listeners) = self.subscribers.read().unwrap().get(&id) {
+            #[cfg(feature = "parallel")]
+            {
+                use rayon::prelude::*;
+                listeners.par_iter().for_each(|listener| {
+                    listener.handle(&event);
+                });
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                std::thread::scope(|s| {
+                    for listener in listeners {
+                        s.spawn(|| listener.handle(&event));
+                    }
+                });
+            }
+        }
+    }
+}
+
+impl Default for SyncEventBus {
     fn default() -> Self {
         Self::new()
     }
