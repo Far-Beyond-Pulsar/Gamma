@@ -4,268 +4,305 @@
 
 # Pulsar Gamma
 
-A **DLL‑safe, data‑driven event system** for Rust plugin architectures.
+A **plugin-safe, data-driven event system** for Rust engines with native
+plugins and scripts.
 
-Gamma lets the host and dynamically‑loaded plugins exchange events safely
-even when they are compiled with different compiler versions, optimisation
-levels, or feature flags.
+- **Plugin-safe dispatch.** Events are routed by a stable 64-bit id, never
+  by `TypeId`/`Any`. Plugins reach the host bus through a `#[repr(C)]`
+  `extern "C"` table, and a test proves delivery both ways with a separately
+  compiled `cdylib`.
+- **Subscription handles.** `subscribe` returns a handle that unsubscribes on
+  drop. Unsubscribing (even yourself) inside a handler is safe.
+- **Immediate or deferred.** `publish` runs handlers now; `publish_deferred`
+  queues until `flush()`, which runs at points you choose.
+- **Dynamic events.** Runtime descriptors and `DynEvent` payloads for
+  scripts, bridged both ways with Rust types declared
+  `#[pulsar_event(dynamic)]`.
+- **Channels.** `Global`, `Entity(id)` or `Class(id)`.
+- **Deterministic order.** Priority, then subscription order; flushes deliver
+  in publish order.
 
-## Architecture
+> **0.2 is a breaking release.** See [CHANGELOG.md](CHANGELOG.md) for the
+> migration notes.
 
+## Crates
+
+```text
+gamma-core   ──► Event trait, EventBus, SyncEventBus, dynamic events, ffi
+gamma-derive ──► #[pulsar_event] / #[derive(Event)]
+gamma        ──► umbrella crate re-exporting both (features: parallel, serde)
 ```
-gamma-core   ──► Event trait, EventBus, EventHandler
-gamma-derive ──► #[pulsar_event] — single‑attribute event definition
-gamma          ─► Umbrella crate that re‑exports both
-```
-
-## Usage
-
-```toml
-[dependencies]
-gamma-core = "0.1"
-gamma-derive = "0.1"
-```
-
-Or use the umbrella crate:
 
 ```toml
 [dependencies]
 gamma = { git = "https://github.com/Far-Beyond-Pulsar/gamma" }
 ```
 
-### Example
+With only the umbrella crate as a dependency, write
+`#[pulsar_event(crate = gamma)]` so the generated code finds the runtime.
+
+## Usage
 
 ```rust
-use gamma_core::EventBus;
+use gamma_core::{Channel, EventBus, SubscribeOptions};
 use gamma_derive::pulsar_event;
 
-#[pulsar_event]                        // ← adds #[repr(C)] + implements Event
+#[pulsar_event]                       // adds #[repr(C)] + implements Event
 struct PlayerJumped {
     height: f32,
-    timestamp: u64,
+    player: u64,
 }
 
-let mut bus = EventBus::new();
+let bus = EventBus::new();
 
-// Subscribe
-bus.subscribe(|e: &PlayerJumped| {
-    println!("Jumped {} at {}", e.height, e.timestamp);
-});
+// Keep the handle: dropping it unsubscribes. `.detach()` keeps it forever.
+let sub = bus.subscribe(|e: &PlayerJumped| println!("jumped {}", e.height));
 
-// Publish
-bus.publish(PlayerJumped { height: 5.0, timestamp: 12345 });
+// Per-entity channel with a priority (higher runs first).
+let only_7 = bus.subscribe_with(
+    SubscribeOptions::channel(Channel::Entity(7)).priority(10),
+    |e: &PlayerJumped| println!("entity 7 jumped {}", e.height),
+);
+
+bus.publish(PlayerJumped { height: 5.0, player: 1 });              // now, Global
+bus.publish_deferred_to(Channel::Entity(7), PlayerJumped { height: 2.0, player: 7 });
+let report = bus.flush();                                          // deliver the queue
+assert_eq!(report.delivered, 1);
+
+sub.unsubscribe();
+drop(only_7);
 ```
 
-The same pattern works across a DLL boundary — the stable type ID
-(`Event::stable_type_id()`) ensures that a plugin's event matches the
-host's subscriber.
+### Deferred delivery
 
-## DLL‑safety checklist
+`publish_deferred` queues; `flush()` delivers the queue oldest-first.
+Handlers that queue more events during a flush get them delivered in the same
+flush, one *round* per generation, up to `max_flush_rounds` (default 16,
+`set_max_flush_rounds` / `flush_with_limit`). The `FlushReport` says how many
+events were delivered, how many rounds ran, whether the limit was hit and how
+many remain. A `flush` called while another flush of the same bus is running
+(from a handler or another thread) does nothing and reports
+`already_flushing`. `flush` swaps the queue out under the lock and delivers
+after releasing it, so publishers never wait for handlers.
 
-| Requirement | What does it? |
-|---|---|
-| [`#[pulsar_event]`](https://docs.rs/gamma-derive/latest/gamma_derive/attr.pulsar_event.html) | Applies `#[repr(C)]` **and** generates a deterministic `stable_type_id()`. No manual attributes needed. |
-| Shared global allocator | `Box<dyn EventHandler>` created in one compilation unit may be dropped in another. Link the same allocator globally (e.g., `mimalloc` or `jemalloc`) to avoid allocator mismatches. |
-| Versioning (optional) | If you plan to evolve event structs at runtime, add a `VERSION` constant to your event type and include it in `stable_type_id()`. |
+Immediate `publish` inside a handler still runs inline (re-entrant); prefer
+`publish_deferred` from handlers, especially while holding engine locks.
 
-## Crate structure
+### Dynamic events (scripts)
 
-| Crate | Purpose |
-|---|---|
-| `gamma-core` | `Event` trait, `EventBus`, internal `EventHandler` — no dependencies beyond `std`. |
-| `gamma-derive` | `#[pulsar_event]` attribute macro and `#[derive(Event)]` derive macro. |
-| `gamma` (root) | Umbrella crate re‑exporting both. Use `use gamma::prelude::*;` for convenience. |
+```rust
+use gamma_core::{Channel, DynEvent, DynValue, Event, EventBus, EventDescriptor, FieldType, SubscribeOptions};
+use gamma_derive::pulsar_event;
+
+#[pulsar_event(dynamic, name = "physics.Hit")]
+struct Hit {
+    target: u64,
+    damage: f64,
+}
+
+let bus = EventBus::new();
+bus.register_event::<Hit>().unwrap();               // Rust type -> descriptor
+
+// A script-declared event.
+let opened = EventDescriptor::dynamic("Door.Opened", [("door", FieldType::U64)]);
+bus.register_descriptor(opened.clone()).unwrap();
+
+// A dynamic subscriber receives the Rust-typed event…
+let _s1 = bus.subscribe_dyn(Hit::stable_type_id(), SubscribeOptions::default(), |e: &DynEvent| {
+    println!("hit fields: {:?}", e.fields);
+});
+bus.publish(Hit { target: 3, damage: 10.0 });
+
+// …and a typed subscriber receives a matching dynamic event.
+let _s2 = bus.subscribe(|h: &Hit| println!("typed hit on {}", h.target));
+let id = bus.descriptor_by_name("physics.Hit").unwrap().id;
+bus.publish_dyn(Channel::Global, &DynEvent::new(id, vec![DynValue::U64(4), DynValue::F64(1.0)])).unwrap();
+```
+
+`DynValue` is `Bool`, `I64`, `F64`, `U64` (entity handles, ids), `Str` or
+`Bytes`. Rust fields map through the `DynField` trait (implemented for
+`bool`, all integers with range checks, `f32`/`f64`, `String`, `Vec<u8>`;
+implement it for your own newtypes). `publish_dyn` checks the event against
+its registered descriptor. For a dynamic Rust type the field schema is part
+of the stable id. The `serde` feature derives `Serialize`/`Deserialize` for
+the dynamic types and `Channel`.
+
+### Channels
+
+A subscriber listens on one channel and a publish targets one channel. There
+is **no fan-out**: an event sent to `Entity(7)` reaches only `Entity(7)`
+subscribers, not `Global` or `Class` ones. Publish twice if both audiences
+need it. `clear_channel(Channel::Entity(e))` drops every subscription of a
+destroyed entity.
+
+### Threads
+
+`EventBus` is single-threaded (`!Send`, handlers need not be `Send`) and uses
+no atomics on the publish path. `SyncEventBus` has the same API with
+`Send + Sync` handlers. `parallel_publish` (immediate only, priorities
+ignored) runs handlers on rayon with the `parallel` feature and on scoped
+threads without it.
+
+## Plugin safety
+
+These claims are tested by `gamma-core/tests/cross_library.rs`. It builds
+`tests/fixtures/plugin` as a `cdylib` in its own cargo invocation (release
+profile, separate target dir, so it has its own copy of gamma-core), loads it
+with `libloading`, and runs the scenario against both `EventBus` and
+`SyncEventBus`.
+
+| Claim | How | Tested by |
+|---|---|---|
+| A plugin's event reaches host subscribers and vice versa, even though the two `Ping` types have different `TypeId`s | Dispatch by `stable_type_id()`; the handler checks the id, size and alignment, then casts. No `Any`. | Steps 1–2 (and an assertion that the `TypeId`s differ) |
+| Channels hold across the boundary | `RawChannel` in every call | Step 3 |
+| Typed ↔ dynamic bridging across the boundary | Dynamic data crosses in Gamma's versioned byte encoding; a plugin's `to_dyn` writes into a host-owned sink | Steps 4–6 |
+| Invalid dynamic events from a plugin are refused | The host validates against the registry | Step 5 |
+| No allocator is shared | A handler is a `RawHandler` whose `drop` function comes from the plugin; deferred plugin events are dropped with the plugin's drop glue; bytes are always copied | Steps 7–8 and `plugin_handlers_dropped_in_plugin_when_bus_is_dropped` |
+| Bad pointers or layouts from a plugin are rejected | Null/misaligned data, bad alignment and bad channels return an error status | `raw_publish_rejects_bad_layouts` |
+
+Host side:
+
+```rust,ignore
+let bus = SyncEventBus::new();
+let init: Symbol<unsafe extern "C" fn(RawBus) -> u32> = lib.get(b"plugin_init")?;
+init(bus.export_raw());                       // hands the plugin a strong reference
+```
+
+Plugin side:
+
+```rust,ignore
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn plugin_init(raw: RawBus) -> u32 {
+    let bus = unsafe { ForeignBus::from_raw(raw) }.unwrap();   // checks ABI_VERSION
+    let sub = bus.subscribe(|p: &Ping| { /* … */ });            // Send + Sync handlers
+    bus.publish(Ping { value: 1 });
+    // keep `bus` and `sub` somewhere; drop both before unloading
+    0
+}
+```
+
+What you are still responsible for:
+
+- **Unloading.** Drop every `ForeignSubscription` and `ForeignBus`, and
+  flush or drop the host bus's queued events from that plugin, before
+  unloading the plugin: the bus calls back into its code.
+- **The id is a contract.** Two event types with the same name and layout
+  (and schema, for dynamic ones) are treated as the same event. Use
+  `name = "..."` to namespace. Prefer FFI-safe fields (numbers, `bool`,
+  arrays, `#[repr(C)]` structs) for typed events that cross between
+  libraries built by different compilers. `String`/`Vec` fields are only
+  layout-compatible with the same compiler; the dynamic path has no such
+  limit.
+- **Threads.** A bus exported from `EventBus` is not thread-safe
+  (`ForeignBus::is_thread_safe()` is false): use it only on the host's bus
+  thread.
+- **Panics** that reach an `extern "C"` function abort the process.
 
 ## Performance
 
-Benchmarks on Apple M3 (8 cores), `cargo bench -p gamma-core --features parallel`.
+`cargo bench -p gamma-core --features parallel` on a 4-vCPU Intel Xeon
+2.1 GHz cloud VM (short runs: `--warm-up-time 0.3 --measurement-time 1`).
+Numbers are indicative; compare runs on the same machine.
 
-### Scaling with payload size
+### Immediate publish
 
-Larger events cost proportionally to their size (copy into the bus). The dispatch
-overhead itself is negligible.
+| Scenario | 0.2 |
+|---|---|
+| `EventBus::publish`, 0 subscribers | 3.4 ns |
+| `EventBus::publish`, 1 subscriber | 18 ns |
+| `EventBus::publish`, 10 / 50 / 200 subscribers | 33 / 125 / 391 ns |
+| `EventBus::publish`, 1 KB event, 1 subscriber | 101 ns |
+| `publish_to(Entity(500))`, 1000 entities with 1 subscriber each | 13 ns |
+| `subscribe` + `unsubscribe` | 133 ns |
+| typed publish → dynamic subscriber (one `to_dyn`) | 55 ns |
+| dynamic publish → typed subscriber (validate + `from_dyn`) | 19 ns |
+| `SyncEventBus::publish`, 1 subscriber | 39 ns |
+| `SyncEventBus::publish` from 1 / 2 / 4 / 8 threads (thread spawn included) | 48 / 75 / 124 / 226 µs |
+| `parallel_publish` overhead, 2 / 4 / 8 no-op subscribers (rayon) | 29 / 48 / 52 µs |
+| 8 subscribers × ~10 µs work: sequential vs `parallel_publish` | 89 µs vs 35 µs |
 
-```mermaid
-xychart-beta
-    title "Publish latency vs event size (1 subscriber)"
-    x-axis ["Empty (0 B)", "1 KB event"]
-    y-axis "nanoseconds" 0 --> 350
-    bar [2.5, 309]
-```
+### Deferred delivery
 
-### Scaling with subscriber count (single-threaded `EventBus`)
-
-Dispatch is O(n) — each additional no-op subscriber adds ~1.4 ns of overhead.
-
-```mermaid
-xychart-beta
-    title "Publish latency vs subscriber count (empty event)"
-    x-axis ["1 sub", "50 subs"]
-    y-axis "nanoseconds" 0 --> 80
-    bar [2.5, 69]
-```
-
-### Concurrent publishers (`SyncEventBus`)
-
-Multiple threads calling `publish()` on the same bus with `SyncEventBus` scale
-linearly — the `RwLock` read-lock shows negligible contention.
-
-```mermaid
-xychart-beta
-    title "Concurrent publish (1 publisher per thread)"
-    x-axis ["1 thread", "2 threads", "4 threads", "8 threads"]
-    y-axis "microseconds" 0 --> 70
-    bar [13, 19, 30, 62]
-```
-
-### Parallel dispatch (`parallel_publish` with rayon)
-
-`parallel_publish` uses a warm thread pool (opt-in via `features = ["parallel"]`).
-Without the feature it falls back to `std::thread::scope` (~6× slower).
-
-```mermaid
-xychart-beta
-    title "Parallel dispatch overhead (no-op handlers)"
-    x-axis ["2 subs", "4 subs", "8 subs"]
-    y-axis "microseconds" 0 --> 65
-    bar "std::thread::scope" [18, 30, 60]
-    bar "rayon (thread pool)" [9, 10, 10]
-```
-
-**With real work (8 subscribers, ~1 µs each):**
-
-```mermaid
-xychart-beta
-    title "8 subs × ~1 µs work each"
-    x-axis ["sequential", "parallel (rayon)"]
-    y-axis "microseconds" 0 --> 25
-    bar [13, 22]
-```
-
-Rayon beats sequential when **each handler exceeds ~2 µs** (for 8 subs).
-The crossover scales with subscriber count: 4 subs need ≈4 µs, 16 subs ≈1 µs.
-
-### Summary
-
-| Scenario | Throughput | Bound by |
+| Scenario | EventBus | SyncEventBus |
 |---|---|---|
-| Publish, 1 sub, empty event | **400 M / sec** | RwLock read (5 ns) |
-| Publish, 1 sub, 1 KB event | **3.2 M / sec** | Memory bandwidth |
-| Publish, 50 subs, no-op | **14 M / sec** | Dispatch loop |
-| Concurrent publish, 8 threads | **120 M / sec** | Thread scheduling |
-| Parallel dispatch (rayon), 8 subs, 10 µs work | **190 M ops / sec** | CPU cores |
+| `flush` of 100 queued events, 1 subscriber | 2.9 µs (35 M events/s) | 5.7 µs (17 M/s) |
+| `flush` of 1 000 | 35 µs (28 M/s) | 58 µs (17 M/s) |
+| `flush` of 10 000 | 337 µs (30 M/s) | 559 µs (18 M/s) |
+| `publish_deferred` + `flush`, 1 000 events, 4 subscribers | 81 µs | |
 
-## Case study: Instance‑level events (Unreal‑style)
+Concurrent `SyncEventBus::publish_deferred` (1 000 events per thread, enqueue
+only, thread spawn included):
 
-Unreal Engine has two levels of event dispatch:
-
-| Level | Example | How |
+| Threads | Time | Throughput |
 |---|---|---|
-| **Global / system** | `Tick`, `BeginPlay` | A central dispatcher fires to all registered actors |
-| **Per‑instance / object** | `OnActorHit`, `OnComponentBeginOverlap` | Fires only on the specific actor/component that was hit |
+| 1 | 115 µs | 8.7 M events/s |
+| 2 | 368 µs | 5.4 M events/s |
+| 4 | 864 µs | 4.6 M events/s |
+| 8 | 1.86 ms | 4.3 M events/s |
 
-Gamma models this with a single type — [`EventBus`] — used at different
-ownership levels:
+The deferred queue is one `Mutex<VecDeque>`, so throughput drops under
+contention. It is held only for the push and for the swap in `flush`.
 
-### Global events → a central `EventBus`
+### Compared with 0.1
 
-Built‑in engine events that any system can subscribe to.
+The same tight loop (`publish` of an empty event, release build, same
+machine), with instruction counts from callgrind:
+
+| | 0.1 | 0.2 |
+|---|---|---|
+| `EventBus`, 0 subscribers | 0.6 ns / 5 instr | 3.5 ns / 53 instr |
+| `EventBus`, 1 subscriber | 4.4 ns / 56 instr | 19 ns / ~190 instr |
+| `EventBus`, 50 subscribers | 172 ns | 142 ns |
+| `SyncEventBus`, 1 subscriber | 21 ns / 90 instr | 39 ns / ~193 instr |
+
+The fixed per-publish cost grew from the channel-aware lookup, the
+re-entrancy-safe snapshot of the subscriber list, and the lazily converted
+dynamic view. The per-subscriber cost is lower than 0.1's `Any` downcast,
+so 0.2 is faster from about 50 subscribers up.
+
+## Case study: global and per-entity events
+
+Unreal-style engines have global events (`Tick`, `BeginPlay`) and
+per-instance events (`OnActorHit`). With 0.1 you needed one `EventBus` per
+actor for the latter. With channels, one bus serves both:
 
 ```rust
-// Anywhere in the engine — subscribe to the global Tick event
-let mut global_events = EventBus::new();
-
-global_events.subscribe(|_: &Tick| {
-    // called every frame
-});
-```
-
-### Per‑instance events → each actor owns its own `EventBus`
-
-This matches Unreal's approach: every `UObject` carries its own delegate map.
-Subscribers are scoped to that specific instance — no central routing needed.
-
-```rust
-use gamma_core::EventBus;
+use gamma_core::{Channel, EventBus, SubscribeOptions, Subscription};
 use gamma_derive::pulsar_event;
 
 #[pulsar_event]
-struct OnDied {
-    killer: u32,
-    damage: f32,
-}
+struct OnDied { killer: u64 }
 
-struct Monster {
-    events: EventBus,
-    health: f32,
-}
+struct Monster { entity: u64, subs: Vec<Subscription> }
 
-impl Monster {
-    pub fn new() -> Self {
-        Self { events: EventBus::new(), health: 100.0 }
-    }
+let world = EventBus::new();
+let mut goblin = Monster { entity: 42, subs: Vec::new() };
 
-    /// Let external code react when *this* monster dies.
-    pub fn on_died<F: Fn(&OnDied) + 'static>(&mut self, f: F) {
-        self.events.subscribe(f);
-    }
+// React when *this* goblin dies…
+goblin.subs.push(world.subscribe_with(
+    SubscribeOptions::channel(Channel::Entity(goblin.entity)),
+    |e: &OnDied| println!("goblin killed by {}", e.killer),
+));
+// …and log every death globally.
+let _log = world.subscribe(|e: &OnDied| println!("something died ({})", e.killer));
 
-    pub fn take_damage(&self, killer: u32, amount: f32) {
-        // … apply damage, check death …
-        self.events.publish(OnDied { killer, damage: amount });
-    }
-}
+world.publish_to(Channel::Entity(42), OnDied { killer: 7 });   // only the goblin's handler
+world.publish(OnDied { killer: 7 });                           // only the global logger
 
-let mut goblin = Monster::new();
-
-// Subscribe to *this specific goblin's* death.
-goblin.on_died(|e: &OnDied| {
-    println!("Goblin killed by {} ({})", e.killer, e.damage);
-});
-
-// Fire the event on the goblin.
-goblin.take_damage(7, 100.0);
+// Despawn: dropping the handles (or clear_channel) removes the handlers.
+drop(goblin);
 ```
 
-### Thread‑safe actors
+A bus per actor still works (`EventBus` is cheap) if you prefer ownership
+over routing.
 
-For actors shared across threads, use [`SyncEventBus`]:
+## Why not `TypeId`?
 
-```rust
-use std::sync::Arc;
-use gamma_core::SyncEventBus;
-
-struct SharedMonster {
-    events: SyncEventBus,
-}
-
-let monster = Arc::new(SharedMonster { events: SyncEventBus::new() });
-let m2 = Arc::clone(&monster);
-
-std::thread::spawn(move || {
-    m2.events.publish(OnDied { killer: 1, damage: 50.0 });
-});
-```
-
-### Global vs instance — when to use each
-
-| You want to… | Use |
-|---|---|
-| Fire a frame‑tick event | Single shared [`EventBus`] |
-| Log / analytics for *every* player death | Single shared [`EventBus`] |
-| React when a *specific* NPC dies | NPC's own [`EventBus`] field |
-| Handle a collision on a particular physics body | Body's own [`EventBus`] field |
-| Cross‑module communication (plugin → host) | Single shared [`EventBus`] |
-
-## Why not just use `TypeId`?
-
-`TypeId::of::<T>()` is **not** stable across compilation units. Two separate
-`rustc` invocations may assign different `TypeId` values to the same type.
-Gamma replaces this with a deterministic hash that is:
-
-- Computed from the type's **name**, **size**, and **alignment**
-- Identical for the same struct compiled in different crates
-- Different for structs with the same name but different field layouts
+`TypeId::of::<T>()` differs between separately compiled libraries (the test
+suite checks this for its plugin), so an `Any`-based bus silently drops
+plugin events. Gamma's id is a deterministic hash of the name, size and
+alignment (plus field names and types for dynamic events), identical in
+every library that declares the same event.
 
 ## License
 
