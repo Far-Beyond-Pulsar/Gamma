@@ -1,0 +1,22 @@
+# A test plugin, built by `tests/cross_library.rs` in its own cargo
+# invocation, profile and target directory, so it links its own separately
+# compiled copy of gamma-core. Not a workspace member.
+[package]
+name = "gamma-test-plugin"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+gamma-core = { path = "../../.." }
+gamma-derive = { path = "../../../../gamma-derive" }
+
+[workspace]
+
+[profile.release]
+opt-level = 2
+codegen-units = 4

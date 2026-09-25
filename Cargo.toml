@@ -1,14 +1,20 @@
 [workspace]
 resolver = "2"
 members = ["gamma-core", "gamma-derive"]
+exclude = ["gamma-core/tests/fixtures/plugin"]
 
 [package]
 name = "gamma"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Pulsar Gamma — a DLL-safe, data-driven event system for Rust plugin architectures"
 
 [dependencies]
-gamma-core = { path = "gamma-core" }
-gamma-derive = { path = "gamma-derive" }
+gamma-core = { path = "gamma-core", version = "0.2.0" }
+gamma-derive = { path = "gamma-derive", version = "0.2.0" }
+
+[features]
+default = []
+parallel = ["gamma-core/parallel"]
+serde = ["gamma-core/serde"]
