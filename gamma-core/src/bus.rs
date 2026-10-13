@@ -178,14 +178,41 @@ macro_rules! common_api {
             self.core.descriptor(id)
         }
 
-        /// The descriptor registered under `name`.
+        /// The descriptor registered under `name` in the main namespace
+        /// (events registered without a namespace). Namespaced events are
+        /// never found here; use
+        /// [`descriptor_by_name_in`](Self::descriptor_by_name_in).
         pub fn descriptor_by_name(&self, name: &str) -> Option<Arc<EventDescriptor>> {
             self.core.descriptor_by_name(name)
         }
 
-        /// All registered descriptors, sorted by name.
+        /// The descriptor registered under `name` in the explicit namespace
+        /// `namespace`. Always `None` for `""` and `"main"`: the main
+        /// namespace cannot be reached by naming it.
+        pub fn descriptor_by_name_in(&self, namespace: &str, name: &str) -> Option<Arc<EventDescriptor>> {
+            self.core.descriptor_by_name_in(namespace, name)
+        }
+
+        /// The main-namespace descriptors, sorted by name.
         pub fn descriptors(&self) -> Vec<Arc<EventDescriptor>> {
             self.core.descriptors()
+        }
+
+        /// The descriptors of the explicit namespace `namespace`, sorted by
+        /// name (empty for `""` and `"main"`).
+        pub fn descriptors_in(&self, namespace: &str) -> Vec<Arc<EventDescriptor>> {
+            self.core.descriptors_in(namespace)
+        }
+
+        /// Every descriptor of every namespace, main namespace first, then by
+        /// namespace and name.
+        pub fn all_descriptors(&self) -> Vec<Arc<EventDescriptor>> {
+            self.core.all_descriptors()
+        }
+
+        /// The explicit namespaces that have registered descriptors, sorted.
+        pub fn namespaces(&self) -> Vec<String> {
+            self.core.namespaces()
         }
 
         /// Hand this bus to a plugin: a `#[repr(C)]` function table holding

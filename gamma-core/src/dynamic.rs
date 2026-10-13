@@ -225,25 +225,50 @@ impl DynField for Vec<u8> {
 pub struct EventDescriptor {
     /// The stable event id (equal to `T::stable_type_id()` for Rust events).
     pub id: u64,
-    /// The event name. Names are unique within a bus's registry.
+    /// The explicit namespace, or `None` for the main namespace (every
+    /// event declared without one). `"main"` and `""` are reserved and are
+    /// refused by [`register_descriptor`](crate::EventBus::register_descriptor).
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub namespace: Option<String>,
+    /// The event name. Names are unique within a namespace of a bus's registry.
     pub name: String,
     /// Field names and types, in declaration order.
     pub fields: Vec<(String, FieldType)>,
 }
 
 impl EventDescriptor {
-    /// A descriptor with an explicit id.
+    /// A descriptor in the main namespace with an explicit id.
     pub fn new(id: u64, name: impl Into<String>, fields: Vec<(String, FieldType)>) -> Self {
         Self {
             id,
+            namespace: None,
             name: name.into(),
             fields,
         }
     }
 
-    /// A descriptor for a runtime-declared (script) event. The id is derived
-    /// from the name and the field list with [`dynamic_event_id`], so the
-    /// same declaration always gets the same id.
+    /// A descriptor in the explicit namespace `namespace` with an explicit id.
+    /// A reserved namespace is only refused when the descriptor is registered.
+    pub fn new_in(
+        id: u64,
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+        fields: Vec<(String, FieldType)>,
+    ) -> Self {
+        Self {
+            id,
+            namespace: Some(namespace.into()),
+            name: name.into(),
+            fields,
+        }
+    }
+
+    /// A descriptor for a runtime-declared (script) event in the main
+    /// namespace. The id is derived from the name and the field list with
+    /// [`dynamic_event_id`], so the same declaration always gets the same id.
     pub fn dynamic<N: Into<String>>(
         name: impl Into<String>,
         fields: impl IntoIterator<Item = (N, FieldType)>,
@@ -252,7 +277,38 @@ impl EventDescriptor {
         let fields: Vec<(String, FieldType)> =
             fields.into_iter().map(|(n, t)| (n.into(), t)).collect();
         let id = dynamic_event_id(&name, &fields);
-        Self { id, name, fields }
+        Self {
+            id,
+            namespace: None,
+            name,
+            fields,
+        }
+    }
+
+    /// Like [`dynamic`](Self::dynamic), in the explicit namespace
+    /// `namespace` (the id is derived with [`dynamic_event_id_in`]).
+    ///
+    /// Fails with [`RegistryError::ReservedNamespace`] for `""` and `"main"`:
+    /// the main namespace is only reachable by not naming a namespace.
+    pub fn dynamic_in<N: Into<String>>(
+        namespace: impl Into<String>,
+        name: impl Into<String>,
+        fields: impl IntoIterator<Item = (N, FieldType)>,
+    ) -> Result<Self, RegistryError> {
+        let namespace = namespace.into();
+        if stable_id::namespace_is_reserved(&namespace) {
+            return Err(RegistryError::ReservedNamespace(namespace));
+        }
+        let name = name.into();
+        let fields: Vec<(String, FieldType)> =
+            fields.into_iter().map(|(n, t)| (n.into(), t)).collect();
+        let id = dynamic_event_id_in(&namespace, &name, &fields);
+        Ok(Self {
+            id,
+            namespace: Some(namespace),
+            name,
+            fields,
+        })
     }
 
     /// Index of the field called `name`.
@@ -287,7 +343,18 @@ impl EventDescriptor {
 /// The id [`EventDescriptor::dynamic`] assigns: an FNV-1a hash over a
 /// `"dyn:"` prefix, the name and every field's name and type tag.
 pub fn dynamic_event_id(name: &str, fields: &[(String, FieldType)]) -> u64 {
-    let mut h = stable_id::fnv_bytes(stable_id::FNV_OFFSET, b"dyn:");
+    dynamic_event_id_from(stable_id::FNV_OFFSET, name, fields)
+}
+
+/// [`dynamic_event_id`] for an event in the explicit namespace `ns`: the
+/// hash starts from [`stable_id::namespace_seed`], so it never equals the
+/// main-namespace id of the same declaration.
+pub fn dynamic_event_id_in(ns: &str, name: &str, fields: &[(String, FieldType)]) -> u64 {
+    dynamic_event_id_from(stable_id::namespace_seed(ns), name, fields)
+}
+
+fn dynamic_event_id_from(seed: u64, name: &str, fields: &[(String, FieldType)]) -> u64 {
+    let mut h = stable_id::fnv_bytes(seed, b"dyn:");
     h = stable_id::fnv_bytes(h, name.as_bytes());
     for (n, t) in fields {
         h = stable_id::fnv_bytes(h, n.as_bytes());
@@ -311,6 +378,9 @@ pub struct DynEvent {
 }
 
 const WIRE_VERSION: u8 = 1;
+/// Descriptor layout with a namespace string (main-namespace descriptors
+/// keep using [`WIRE_VERSION`]).
+const WIRE_VERSION_NS: u8 = 2;
 
 impl DynEvent {
     /// A new dynamic event.
@@ -389,9 +459,19 @@ impl DynEvent {
 impl EventDescriptor {
     /// Serialise into the ABI-stable wire format used to register
     /// descriptors across a library boundary.
+    ///
+    /// Main-namespace descriptors use the original (version 1) layout, so
+    /// older libraries still understand them. Namespaced descriptors use
+    /// version 2, which adds the namespace string after the id.
     pub fn encode(&self, out: &mut Vec<u8>) {
-        out.push(WIRE_VERSION);
+        match &self.namespace {
+            None => out.push(WIRE_VERSION),
+            Some(_) => out.push(WIRE_VERSION_NS),
+        }
         out.extend_from_slice(&self.id.to_le_bytes());
+        if let Some(ns) = &self.namespace {
+            put_bytes(out, ns.as_bytes());
+        }
         put_bytes(out, self.name.as_bytes());
         out.extend_from_slice(&(self.fields.len() as u32).to_le_bytes());
         for (n, t) in &self.fields {
@@ -403,10 +483,16 @@ impl EventDescriptor {
     /// Parse the output of [`encode`](Self::encode).
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut r = Reader(bytes);
-        if r.u8()? != WIRE_VERSION {
+        let version = r.u8()?;
+        if version != WIRE_VERSION && version != WIRE_VERSION_NS {
             return Err(DecodeError);
         }
         let id = r.u64()?;
+        let namespace = if version == WIRE_VERSION_NS {
+            Some(r.string()?)
+        } else {
+            None
+        };
         let name = r.string()?;
         let count = r.u32()? as usize;
         let mut fields = Vec::with_capacity(count.min(r.0.len() / 5));
@@ -418,7 +504,12 @@ impl EventDescriptor {
         if !r.0.is_empty() {
             return Err(DecodeError);
         }
-        Ok(Self { id, name, fields })
+        Ok(Self {
+            id,
+            namespace,
+            name,
+            fields,
+        })
     }
 }
 
@@ -530,6 +621,9 @@ pub enum RegistryError {
     },
     /// The Rust type was not declared with `#[pulsar_event(dynamic)]`.
     NotReflected,
+    /// The namespace is `""` or `"main"`. Events outside any namespace are
+    /// in the main namespace, which cannot be named explicitly.
+    ReservedNamespace(String),
 }
 
 impl fmt::Display for RegistryError {
@@ -549,6 +643,12 @@ impl fmt::Display for RegistryError {
             }
             Self::NotReflected => {
                 f.write_str("event type is not declared with #[pulsar_event(dynamic)]")
+            }
+            Self::ReservedNamespace(ns) => {
+                write!(
+                    f,
+                    "namespace {ns:?} is reserved (events without a namespace are in the main namespace)"
+                )
             }
         }
     }
@@ -580,6 +680,33 @@ mod tests {
         let mut b = Vec::new();
         d.encode(&mut b);
         assert_eq!(EventDescriptor::decode(&b).unwrap(), d);
+    }
+
+    #[test]
+    fn namespaced_descriptor_roundtrip_and_ids() {
+        let main = EventDescriptor::dynamic("Hit", [("t", FieldType::U64)]);
+        let ns = EventDescriptor::dynamic_in("engine", "Hit", [("t", FieldType::U64)]).unwrap();
+        assert_ne!(main.id, ns.id);
+        assert_eq!(main.namespace, None);
+        let mut b = Vec::new();
+        ns.encode(&mut b);
+        assert_eq!(b[0], 2);
+        assert_eq!(EventDescriptor::decode(&b).unwrap(), ns);
+        // Main descriptors keep the original wire layout.
+        let mut b = Vec::new();
+        main.encode(&mut b);
+        assert_eq!(b[0], 1);
+        assert_eq!(EventDescriptor::decode(&b).unwrap(), main);
+    }
+
+    #[test]
+    fn main_namespace_cannot_be_named() {
+        for ns in ["main", ""] {
+            assert_eq!(
+                EventDescriptor::dynamic_in(ns, "E", [("a", FieldType::Bool)]),
+                Err(RegistryError::ReservedNamespace(ns.into()))
+            );
+        }
     }
 
     #[test]

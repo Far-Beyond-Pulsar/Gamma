@@ -94,7 +94,7 @@ pub use channel::Channel;
 pub use core::FlushReport;
 pub use dynamic::{
     DecodeError, DynEvent, DynEventError, DynField, DynValue, EventDescriptor, FieldType,
-    RegistryError, dynamic_event_id,
+    RegistryError, dynamic_event_id, dynamic_event_id_in,
 };
 
 /// The default limit on flush rounds (see [`EventBus::flush`]).
@@ -151,5 +151,7 @@ pub trait Event: 'static {
 
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::stable_id::{type_id, type_id_with_fields};
+    pub use crate::stable_id::{
+        type_id, type_id_in, type_id_with_fields, type_id_with_fields_in,
+    };
 }

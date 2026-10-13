@@ -26,11 +26,47 @@ pub const fn fnv_u64(hash: u64, value: u64) -> u64 {
     (hash ^ value).wrapping_mul(FNV_PRIME)
 }
 
-/// Id of a plain `#[pulsar_event]`: name, size and alignment.
-pub const fn type_id(name: &str, size: usize, align: usize) -> u64 {
-    let h = fnv_bytes(FNV_OFFSET, name.as_bytes());
+/// The name of the implicit namespace every un-namespaced event lives in.
+/// It cannot be named explicitly: see [`namespace_is_reserved`].
+pub const MAIN_NAMESPACE: &str = "main";
+
+/// `true` for namespace names that may not be used explicitly: the empty
+/// string and [`MAIN_NAMESPACE`]. Events outside any namespace live in the
+/// main namespace; reaching it by name would let a plugin shadow or
+/// impersonate them.
+pub const fn namespace_is_reserved(ns: &str) -> bool {
+    let b = ns.as_bytes();
+    b.is_empty() || (b.len() == 4 && b[0] == b'm' && b[1] == b'a' && b[2] == b'i' && b[3] == b'n')
+}
+
+/// Hash seed of an explicit namespace. Ids of namespaced events start from
+/// this instead of [`FNV_OFFSET`], so they never equal the id of the same
+/// name in the main namespace (or in another namespace).
+pub const fn namespace_seed(ns: &str) -> u64 {
+    let h = fnv_bytes(FNV_OFFSET, b"ns:");
+    let h = fnv_bytes(h, ns.as_bytes());
+    fnv_u64(h, 0xff)
+}
+
+const fn type_id_from(seed: u64, name: &str, size: usize, align: usize) -> u64 {
+    let h = fnv_bytes(seed, name.as_bytes());
     let h = fnv_u64(h, size as u64);
     fnv_u64(h, align as u64)
+}
+
+const fn mix_fields(mut h: u64, fields: &[(&str, FieldType)]) -> u64 {
+    let mut i = 0;
+    while i < fields.len() {
+        h = fnv_bytes(h, fields[i].0.as_bytes());
+        h = fnv_u64(h, fields[i].1.tag() as u64);
+        i += 1;
+    }
+    h
+}
+
+/// Id of a plain `#[pulsar_event]`: name, size and alignment.
+pub const fn type_id(name: &str, size: usize, align: usize) -> u64 {
+    type_id_from(FNV_OFFSET, name, size, align)
 }
 
 /// Id of a `#[pulsar_event(dynamic)]`: [`type_id`] plus every field's name
@@ -42,14 +78,23 @@ pub const fn type_id_with_fields(
     align: usize,
     fields: &[(&str, FieldType)],
 ) -> u64 {
-    let mut h = type_id(name, size, align);
-    let mut i = 0;
-    while i < fields.len() {
-        h = fnv_bytes(h, fields[i].0.as_bytes());
-        h = fnv_u64(h, fields[i].1.tag() as u64);
-        i += 1;
-    }
-    h
+    mix_fields(type_id(name, size, align), fields)
+}
+
+/// [`type_id`] for an event in the explicit namespace `ns`.
+pub const fn type_id_in(ns: &str, name: &str, size: usize, align: usize) -> u64 {
+    type_id_from(namespace_seed(ns), name, size, align)
+}
+
+/// [`type_id_with_fields`] for an event in the explicit namespace `ns`.
+pub const fn type_id_with_fields_in(
+    ns: &str,
+    name: &str,
+    size: usize,
+    align: usize,
+    fields: &[(&str, FieldType)],
+) -> u64 {
+    mix_fields(type_id_in(ns, name, size, align), fields)
 }
 
 #[cfg(test)]
@@ -87,5 +132,27 @@ mod tests {
         assert_ne!(a, b);
         assert_ne!(a, c);
         assert_ne!(a, type_id("E", 8, 8));
+    }
+
+    #[test]
+    fn namespaces_change_the_id() {
+        let main = type_id("E", 8, 8);
+        let a = type_id_in("a", "E", 8, 8);
+        let b = type_id_in("b", "E", 8, 8);
+        assert_ne!(main, a);
+        assert_ne!(a, b);
+        assert_ne!(
+            type_id_with_fields("E", 8, 8, &[("x", FieldType::U64)]),
+            type_id_with_fields_in("a", "E", 8, 8, &[("x", FieldType::U64)])
+        );
+    }
+
+    #[test]
+    fn reserved_namespaces() {
+        assert!(namespace_is_reserved(""));
+        assert!(namespace_is_reserved("main"));
+        assert!(!namespace_is_reserved("Main"));
+        assert!(!namespace_is_reserved("mainx"));
+        assert!(!namespace_is_reserved("engine"));
     }
 }

@@ -10,7 +10,8 @@
 //! | Option | Effect |
 //! |---|---|
 //! | `dynamic` | Also implement the dynamic side of [`Event`]: `descriptor`, `to_dyn`, `from_dyn` (every field must implement `DynField`). The field schema is mixed into the stable id. |
-//! | `name = "..."` | Use this name for the id and descriptor instead of the struct name (for namespacing, e.g. `"physics.Hit"`). |
+//! | `name = "..."` | Use this name for the id and descriptor instead of the struct name. |
+//! | `namespace = "..."` | Put the event in an explicit namespace (e.g. an engine plugin's name). It is mixed into the id and recorded in the descriptor, so equal names in different namespaces are different events. Without it the event is in the main namespace; `"main"` and `""` are reserved and rejected. |
 //! | `crate = path` | Path to `gamma_core` (default `::gamma_core`); use `crate = gamma` when depending only on the umbrella crate. |
 //!
 //! [`Event`]: https://docs.rs/gamma-core/latest/gamma_core/trait.Event.html
@@ -24,6 +25,7 @@ use syn::{DeriveInput, Fields, LitStr, Path, parse_macro_input};
 struct Options {
     dynamic: bool,
     name: Option<LitStr>,
+    namespace: Option<LitStr>,
     krate: Option<Path>,
 }
 
@@ -33,6 +35,15 @@ impl Options {
             self.dynamic = true;
         } else if meta.path.is_ident("name") {
             self.name = Some(meta.value()?.parse()?);
+        } else if meta.path.is_ident("namespace") {
+            let ns: LitStr = meta.value()?.parse()?;
+            if matches!(ns.value().as_str(), "" | "main") {
+                return Err(syn::Error::new_spanned(
+                    ns,
+                    "`main` and the empty string are reserved: omit `namespace` to use the main namespace",
+                ));
+            }
+            self.namespace = Some(ns);
         } else if meta.path.is_ident("crate") {
             let v = meta.value()?;
             self.krate = Some(if v.peek(LitStr) {
@@ -41,7 +52,7 @@ impl Options {
                 v.parse()?
             });
         } else {
-            return Err(meta.error("expected `dynamic`, `name = \"...\"` or `crate = path`"));
+            return Err(meta.error("expected `dynamic`, `name = \"...\"`, `namespace = \"...\"` or `crate = path`"));
         }
         Ok(())
     }
@@ -142,16 +153,31 @@ fn generate_event_impl(
         .map(LitStr::value)
         .unwrap_or_else(|| name.to_string());
 
+    let ns = opts.namespace.as_ref();
+
     if !opts.dynamic {
+        let id = match ns {
+            None => quote! {
+                #krate::__private::type_id(
+                    #event_name,
+                    ::core::mem::size_of::<#name>(),
+                    ::core::mem::align_of::<#name>(),
+                )
+            },
+            Some(ns) => quote! {
+                #krate::__private::type_id_in(
+                    #ns,
+                    #event_name,
+                    ::core::mem::size_of::<#name>(),
+                    ::core::mem::align_of::<#name>(),
+                )
+            },
+        };
         return Ok(quote! {
             impl #krate::Event for #name {
                 #[inline]
                 fn stable_type_id() -> u64 {
-                    const ID: u64 = #krate::__private::type_id(
-                        #event_name,
-                        ::core::mem::size_of::<#name>(),
-                        ::core::mem::align_of::<#name>(),
-                    );
+                    const ID: u64 = #id;
                     ID
                 }
             }
@@ -180,27 +206,55 @@ fn generate_event_impl(
         Fields::Unit => quote! { #name },
     };
 
+    let id = match ns {
+        None => quote! {
+            #krate::__private::type_id_with_fields(
+                #event_name,
+                ::core::mem::size_of::<#name>(),
+                ::core::mem::align_of::<#name>(),
+                &[ #( (#field_names, <#types as #krate::DynField>::FIELD_TYPE) ),* ],
+            )
+        },
+        Some(ns) => quote! {
+            #krate::__private::type_id_with_fields_in(
+                #ns,
+                #event_name,
+                ::core::mem::size_of::<#name>(),
+                ::core::mem::align_of::<#name>(),
+                &[ #( (#field_names, <#types as #krate::DynField>::FIELD_TYPE) ),* ],
+            )
+        },
+    };
+    let descriptor = match ns {
+        None => quote! {
+            #krate::EventDescriptor::new(
+                <Self as #krate::Event>::stable_type_id(),
+                #event_name,
+                ::std::vec![ #( (::std::string::String::from(#field_names), <#types as #krate::DynField>::FIELD_TYPE) ),* ],
+            )
+        },
+        Some(ns) => quote! {
+            #krate::EventDescriptor::new_in(
+                <Self as #krate::Event>::stable_type_id(),
+                #ns,
+                #event_name,
+                ::std::vec![ #( (::std::string::String::from(#field_names), <#types as #krate::DynField>::FIELD_TYPE) ),* ],
+            )
+        },
+    };
+
     Ok(quote! {
         impl #krate::Event for #name {
             #[inline]
             fn stable_type_id() -> u64 {
-                const ID: u64 = #krate::__private::type_id_with_fields(
-                    #event_name,
-                    ::core::mem::size_of::<#name>(),
-                    ::core::mem::align_of::<#name>(),
-                    &[ #( (#field_names, <#types as #krate::DynField>::FIELD_TYPE) ),* ],
-                );
+                const ID: u64 = #id;
                 ID
             }
 
             const REFLECTED: bool = true;
 
             fn descriptor() -> ::core::option::Option<#krate::EventDescriptor> {
-                ::core::option::Option::Some(#krate::EventDescriptor::new(
-                    <Self as #krate::Event>::stable_type_id(),
-                    #event_name,
-                    ::std::vec![ #( (::std::string::String::from(#field_names), <#types as #krate::DynField>::FIELD_TYPE) ),* ],
-                ))
+                ::core::option::Option::Some(#descriptor)
             }
 
             fn to_dyn(&self) -> ::core::option::Option<#krate::DynEvent> {

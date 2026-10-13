@@ -501,7 +501,10 @@ pub struct FlushReport {
 #[derive(Default)]
 pub(crate) struct Registry {
     by_id: FxHashMap<u64, Arc<EventDescriptor>>,
+    /// Names in the main namespace (descriptors without a namespace).
     by_name: FxHashMap<String, u64>,
+    /// Names in explicit namespaces. Never holds a reserved namespace.
+    by_ns: FxHashMap<String, FxHashMap<String, u64>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +759,11 @@ impl<H: ?Sized + Slot> Core<H> {
     // --- registry --------------------------------------------------------
 
     pub(crate) fn register(&self, desc: EventDescriptor) -> Result<u64, RegistryError> {
+        if let Some(ns) = &desc.namespace {
+            if crate::stable_id::namespace_is_reserved(ns) {
+                return Err(RegistryError::ReservedNamespace(ns.clone()));
+            }
+        }
         self.registry.write(|r| {
             if let Some(existing) = r.by_id.get(&desc.id) {
                 return if **existing == desc {
@@ -767,14 +775,18 @@ impl<H: ?Sized + Slot> Core<H> {
                     })
                 };
             }
-            if let Some(&existing_id) = r.by_name.get(&desc.name) {
+            let names = match &desc.namespace {
+                None => &mut r.by_name,
+                Some(ns) => r.by_ns.entry(ns.clone()).or_default(),
+            };
+            if let Some(&existing_id) = names.get(&desc.name) {
                 return Err(RegistryError::NameConflict {
                     name: desc.name,
                     existing_id,
                 });
             }
             let id = desc.id;
-            r.by_name.insert(desc.name.clone(), id);
+            names.insert(desc.name.clone(), id);
             r.by_id.insert(id, Arc::new(desc));
             Ok(id)
         })
@@ -789,9 +801,59 @@ impl<H: ?Sized + Slot> Core<H> {
             .read(|r| r.by_name.get(name).and_then(|id| r.by_id.get(id)).cloned())
     }
 
+    /// Descriptors in explicit namespace `ns`; `None` for a reserved name
+    /// (the main namespace is never reachable this way).
+    pub(crate) fn descriptor_by_name_in(
+        &self,
+        ns: &str,
+        name: &str,
+    ) -> Option<Arc<EventDescriptor>> {
+        self.registry.read(|r| {
+            r.by_ns
+                .get(ns)
+                .and_then(|m| m.get(name))
+                .and_then(|id| r.by_id.get(id))
+                .cloned()
+        })
+    }
+
+    /// Main-namespace descriptors, sorted by name.
     pub(crate) fn descriptors(&self) -> Vec<Arc<EventDescriptor>> {
-        let mut v: Vec<_> = self.registry.read(|r| r.by_id.values().cloned().collect());
+        let mut v: Vec<_> = self.registry.read(|r| {
+            r.by_id
+                .values()
+                .filter(|d| d.namespace.is_none())
+                .cloned()
+                .collect()
+        });
         v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+
+    /// Descriptors of explicit namespace `ns`, sorted by name.
+    pub(crate) fn descriptors_in(&self, ns: &str) -> Vec<Arc<EventDescriptor>> {
+        let mut v: Vec<_> = self.registry.read(|r| {
+            r.by_id
+                .values()
+                .filter(|d| d.namespace.as_deref() == Some(ns))
+                .cloned()
+                .collect()
+        });
+        v.sort_by(|a, b| a.name.cmp(&b.name));
+        v
+    }
+
+    /// Every descriptor, sorted by (namespace, name); main first.
+    pub(crate) fn all_descriptors(&self) -> Vec<Arc<EventDescriptor>> {
+        let mut v: Vec<_> = self.registry.read(|r| r.by_id.values().cloned().collect());
+        v.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+        v
+    }
+
+    /// Explicit namespaces that have at least one descriptor, sorted.
+    pub(crate) fn namespaces(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.registry.read(|r| r.by_ns.keys().cloned().collect());
+        v.sort();
         v
     }
 
