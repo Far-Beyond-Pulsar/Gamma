@@ -518,12 +518,55 @@ pub(crate) struct Table<H: ?Sized + Slot> {
 
 pub(crate) struct Core<H: ?Sized + Slot> {
     table: H::Lock<Table<H>>,
-    queue: H::Mutex<VecDeque<Queued>>,
+    /// Deferred events, sharded per channel (`queue_shard`). Each queued
+    /// event carries its global sequence number; flush merging restores the
+    /// publish order across shards.
+    queue: [H::Mutex<Shard>; QUEUE_SHARDS],
+    /// The flush side's merge buffer: shard batches drained into it and
+    /// ordered by sequence number. Touched only while the flush's
+    /// `flushing` flag excludes every other flush and nested flushes are
+    /// refused, so it is single-owner for the whole flush; the owner swaps
+    /// contents in and out, keeping capacity across flushes.
+    batch_scratch: H::Mutex<Vec<(u64, Queued)>>,
+    /// Stamps every queued event with its publish sequence.
+    next_seq: AtomicU64,
     registry: H::Lock<Registry>,
     next_token: AtomicU64,
     flushing: AtomicBool,
     max_rounds: AtomicU32,
 }
+
+// ---------------------------------------------------------------------------
+// Deferred queue
+// ---------------------------------------------------------------------------
+
+/// The deferred queue is sharded per channel (see [`queue_shard`]) so a
+/// publish locks only its own channel's shard. The cross-shard publish order
+/// is restored at flush time by the sequence number stamped on each queued
+/// event, so the delivery contract stays exactly what it was with one queue:
+/// published order across everything.
+const QUEUE_SHARDS: usize = 16;
+
+/// The shard holding the deferred queue for `channel`. Cheap and stable:
+/// two publishes of the same channel always land on the same shard (kept in
+/// that shard's FIFO), independent channels mostly split across shards.
+fn queue_shard(channel: Channel) -> usize {
+    let (discriminant, value) = match channel {
+        Channel::Global => (0u64, 0),
+        Channel::Entity(value) => (1, value),
+        Channel::Class(value) => (2, value),
+    };
+    // FNV-1a over the discriminant then the value.
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    hash = (hash ^ discriminant).wrapping_mul(0x100_0000_01b3);
+    hash = (hash ^ value).wrapping_mul(0x100_0000_01b3);
+    (hash % QUEUE_SHARDS as u64) as usize
+}
+
+/// One shard of the deferred queue: channel ordered events, in publish order
+/// (the sequence stamp restores the global order at flush time).
+#[derive(Default)]
+struct Shard(VecDeque<(u64, Queued)>);
 
 impl<H: ?Sized + Slot> Core<H> {
     pub(crate) fn new() -> Self {
@@ -532,7 +575,9 @@ impl<H: ?Sized + Slot> Core<H> {
                 lists: FxHashMap::default(),
                 tokens: FxHashMap::default(),
             }),
-            queue: Lock::new(VecDeque::new()),
+            queue: std::array::from_fn(|_| Lock::new(Shard::default())),
+            batch_scratch: Lock::new(Vec::new()),
+            next_seq: AtomicU64::new(0),
             registry: Lock::new(Registry::default()),
             next_token: AtomicU64::new(1),
             flushing: AtomicBool::new(false),
@@ -688,11 +733,16 @@ impl<H: ?Sized + Slot> Core<H> {
     }
 
     pub(crate) fn enqueue(&self, q: Queued) {
-        self.queue.write(|queue| queue.push_back(q));
+        let shard = queue_shard(q.channel);
+        let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+        self.queue[shard].write(|shard| shard.0.push_back((seq, q)));
     }
 
     pub(crate) fn queued_len(&self) -> usize {
-        self.queue.read(VecDeque::len)
+        self.queue
+            .iter()
+            .map(|shard| shard.read(|shard| shard.0.len()))
+            .sum()
     }
 
     pub(crate) fn max_rounds(&self) -> u32 {
@@ -735,24 +785,45 @@ impl<H: ?Sized + Slot> Core<H> {
 
     fn drain(&self, max_rounds: u32, report: &mut FlushReport) {
         loop {
-            let batch = self.queue.write(|q| {
-                if q.is_empty() {
-                    None
-                } else if report.rounds >= max_rounds {
-                    report.hit_round_limit = true;
-                    None
-                } else {
-                    Some(std::mem::take(q))
+            // Anything queued next round: dispatch, then go again.
+            if self.queued_len() == 0 {
+                return;
+            }
+            if report.rounds >= max_rounds {
+                report.hit_round_limit = true;
+                return;
+            }
+            // One shard lock at a time; publishers to other shards (and to
+            // this one, on another thread) keep going while we collect.
+            let mut collected = false;
+            for shard in &self.queue {
+                let had_events = shard.write(|shard| !shard.0.is_empty());
+                if had_events {
+                    self.batch_scratch
+                        .write(|batch| shard.write(|shard| batch.extend(shard.0.drain(..))));
+                    collected = true;
                 }
+            }
+            if !collected {
+                return;
+            }
+            // Restore the publish order across shard batches by sequence
+            // stamp, then deliver. Events queued by handlers during these
+            // deliveries only go to the shards, never to the scratch: take
+            // the merged batch out, deliver it, and return the buffer after
+            // the round so its capacity carries over.
+            let mut merged = self.batch_scratch.write(|batch| {
+                batch.sort_unstable_by_key(|(seq, _)| *seq);
+                std::mem::take(batch)
             });
-            let Some(batch) = batch else { return };
             report.rounds += 1;
-            // Delivered after the queue lock is released; each event is
-            // dropped right after its delivery.
-            for ev in batch {
-                self.dispatch_owned(&ev);
+            for (_, event) in merged.drain(..) {
+                // Dropped right after its delivery, like the single queue.
+                self.dispatch_owned(&event);
+                drop(event);
                 report.delivered += 1;
             }
+            self.batch_scratch.write(|batch| *batch = merged);
         }
     }
 

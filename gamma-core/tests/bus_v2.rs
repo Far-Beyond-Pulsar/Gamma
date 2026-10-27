@@ -1003,3 +1003,112 @@ fn concurrent_flushes_never_strand_events() {
     );
     assert_eq!(delivered.load(Ordering::SeqCst), 8000);
 }
+
+// ---------------------------------------------------------------------------
+// Deferred queue sharding (per-channel shards, publish order preserved)
+// ---------------------------------------------------------------------------
+
+/// One subscriber per channel; publishes to many channels interleave. A
+/// flush must deliver the whole queue in publish order: the deferred queue
+/// is sharded per channel, so the delivery order has to be restored across
+/// shards. (What must not change is *anything* about the order contract.)
+#[test]
+fn interleaved_publishes_across_channels_flush_in_publish_order() {
+    let bus = SyncEventBus::new();
+    let channels = [
+        Channel::Global,
+        Channel::Entity(1),
+        Channel::Entity(2),
+        Channel::Class(3),
+    ];
+    let seen = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let mut subs = Vec::new();
+    for (index, _) in channels.iter().enumerate() {
+        let g = Arc::clone(&seen);
+        subs.push(bus.subscribe_with(
+            SubscribeOptions::channel(channels[index]).priority(index as i32),
+            move |h: &Hit| g.lock().unwrap().push(h.target),
+        ));
+
+    }
+    // Many interleaved publishes: shard assignments differ; the delivered
+    // order is the single publish order.
+    for round in 0..64u64 {
+        for (shard, channel) in channels.iter().enumerate() {
+            bus.publish_deferred_to(
+                *channel,
+                Hit {
+                    target: round * 4 + shard as u64,
+                    damage: 0.0,
+                    critical: false,
+                },
+            );
+        }
+    }
+    assert_eq!(bus.queued_len(), 4 * 64);
+    let report = bus.flush();
+    assert_eq!(report.delivered, 4 * 64);
+    let expected: Vec<u64> = (0..64u64)
+        .flat_map(|round| (0..4u64).map(move |s| round * 4 + s))
+        .collect();
+    assert_eq!(*seen.lock().unwrap(), expected, "publish order preserved");
+    assert_eq!(bus.flush().delivered, 0);
+}
+
+/// Publishes from four threads onto distinct entity channels while the main
+/// thread flushes in scope: everything is delivered exactly once, none
+/// stranded, and nothing left queued.
+#[test]
+fn sharded_concurrent_publishes_deliver_everything_exactly_once() {
+    let bus = SyncEventBus::new();
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let mut subs = Vec::new();
+    for entity in 0..4u64 {
+        let d = Arc::clone(&delivered);
+        subs.push(bus.subscribe_with(
+            SubscribeOptions::channel(Channel::Entity(entity)),
+            move |_: &Ping| {
+                d.fetch_add(1, Ordering::SeqCst);
+            },
+        ));
+    }
+    std::thread::scope(|s| {
+        for offset in 0..4u64 {
+            let bus = bus.clone();
+            s.spawn(move || {
+                for i in 0..1000u32 {
+                    // Each thread uses its own entity channel, so the four
+                    // streams interleave through the shard set.
+                    bus.publish_deferred_to(
+                        Channel::Entity(offset),
+                        Ping(i),
+                    );
+                }
+            });
+        }
+    });
+    bus.flush();
+    assert_eq!(delivered.load(Ordering::SeqCst), 4000);
+    assert_eq!(bus.queued_len(), 0);
+}
+
+/// A single-threaded bus has the same publishing-order contract while the
+/// queue is sharded: every deferred payload is delivered before the flush
+/// returns, in the order publishes reached their shards.
+#[test]
+fn single_threaded_multi_shard_round_limit_accounting() {
+    let bus = EventBus::new();
+    let seen = log();
+    let s = Rc::clone(&seen);
+    let _sub = bus.subscribe_with(
+        SubscribeOptions::channel(Channel::Entity(9)),
+        move |p: &Ping| s.borrow_mut().push(p.0),
+    );
+    bus.publish_deferred_to(Channel::Entity(9), Ping(0));
+    bus.publish_deferred(Ping(1)); // global: different shard, no subscriber
+    bus.publish_deferred_to(Channel::Entity(9), Ping(2));
+    let report = bus.flush();
+    assert_eq!(report.delivered, 3, "global counts too: it is dispatched");
+    assert_eq!(*seen.borrow(), vec![0, 2], "entity channel order kept");
+    assert_eq!((report.rounds, report.hit_round_limit, report.remaining), (1, false, 0));
+}
