@@ -87,14 +87,14 @@ pub mod ffi;
 pub mod stable_id;
 
 pub use bus::{
-    EventBus, SubscribeOptions, Subscription, SyncEventBus, SyncSubscription, WeakEventBus,
-    WeakSyncEventBus,
+    EventBus, SubscribeOptions, Subscription, SubscriptionBatch, SyncEventBus, SyncSubscription,
+    SyncSubscriptionBatch, WeakEventBus, WeakSyncEventBus,
 };
 pub use channel::Channel;
 pub use core::FlushReport;
 pub use dynamic::{
-    DecodeError, DynEvent, DynEventError, DynField, DynValue, EventDescriptor, FieldType,
-    RegistryError, dynamic_event_id, dynamic_event_id_in,
+    DecodeError, DynEvent, DynEventError, DynEventSink, DynField, DynValue, EventDescriptor,
+    FieldType, RegistryError, SinkSpares, dynamic_event_id, dynamic_event_id_in,
 };
 
 /// The default limit on flush rounds (see [`EventBus::flush`]).
@@ -138,6 +138,25 @@ pub trait Event: 'static {
         None
     }
 
+    /// Write this event's dynamic form into `sink`, reusing the sink's
+    /// pooled buffers. Returns `false` unless the type is reflected.
+    ///
+    /// `#[pulsar_event(dynamic)]` implements this directly into the pooled
+    /// buffers; for a hand-written `Event` the default builds the
+    /// [`to_dyn`](Event::to_dyn) form and moves it in.
+    fn to_dyn_into(&self, sink: &mut DynEventSink) -> bool {
+        match self.to_dyn() {
+            Some(d) => {
+                sink.id = d.id;
+                for v in d.fields {
+                    sink.push_fixed(v);
+                }
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Build from a dynamic event with this type's id and fields. `None` on
     /// a mismatch or if the type is not reflected.
     fn from_dyn(event: &DynEvent) -> Option<Self>
@@ -151,7 +170,5 @@ pub trait Event: 'static {
 
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::stable_id::{
-        type_id, type_id_in, type_id_with_fields, type_id_with_fields_in,
-    };
+    pub use crate::stable_id::{type_id, type_id_in, type_id_with_fields, type_id_with_fields_in};
 }

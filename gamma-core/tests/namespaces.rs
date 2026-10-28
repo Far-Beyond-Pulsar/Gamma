@@ -51,7 +51,8 @@ fn same_name_different_namespace_is_a_different_event() {
     let bus = EventBus::new();
     let (main, engine) = (counter(), counter());
     let (m, e) = (main.clone(), engine.clone());
-    bus.subscribe(move |_: &MainHit| m.set(m.get() + 1)).detach();
+    bus.subscribe(move |_: &MainHit| m.set(m.get() + 1))
+        .detach();
     bus.subscribe(move |_: &EngineHit| e.set(e.get() + 1))
         .detach();
 
@@ -97,12 +98,8 @@ fn main_namespace_is_not_reachable_by_name() {
             Err(RegistryError::ReservedNamespace(ns.into()))
         );
         // Hand-built or decoded descriptors are refused at registration.
-        let forged = EventDescriptor::new_in(
-            1,
-            ns,
-            "Forged",
-            vec![("amount".into(), FieldType::U64)],
-        );
+        let forged =
+            EventDescriptor::new_in(1, ns, "Forged", vec![("amount".into(), FieldType::U64)]);
         assert_eq!(
             bus.register_descriptor(forged),
             Err(RegistryError::ReservedNamespace(ns.into()))
@@ -134,11 +131,17 @@ fn dynamic_events_are_isolated() {
         })
         .detach();
     }
-    bus.publish_dyn(Channel::Global, &DynEvent::new(engine.id, vec![DynValue::U64(1)]))
-        .unwrap();
+    bus.publish_dyn(
+        Channel::Global,
+        &DynEvent::new(engine.id, vec![DynValue::U64(1)]),
+    )
+    .unwrap();
     assert_eq!(hits.get(), [0, 1, 0]);
-    bus.publish_dyn(Channel::Global, &DynEvent::new(main.id, vec![DynValue::U64(1)]))
-        .unwrap();
+    bus.publish_dyn(
+        Channel::Global,
+        &DynEvent::new(main.id, vec![DynValue::U64(1)]),
+    )
+    .unwrap();
     assert_eq!(hits.get(), [1, 1, 0]);
 }
 
@@ -165,7 +168,10 @@ fn namespaced_descriptors_cross_the_plugin_boundary() {
     let plugin_side = unsafe { ForeignBus::from_raw(host.export_raw()) }.unwrap();
     let d = EventDescriptor::dynamic_in("engine", "Tick", [("dt", FieldType::F64)]).unwrap();
     plugin_side.register_descriptor(&d).unwrap();
-    assert_eq!(host.descriptor_by_name_in("engine", "Tick").unwrap().id, d.id);
+    assert_eq!(
+        host.descriptor_by_name_in("engine", "Tick").unwrap().id,
+        d.id
+    );
     assert!(host.descriptor_by_name("Tick").is_none());
 
     let forged = EventDescriptor::new_in(5, "main", "X", vec![]);

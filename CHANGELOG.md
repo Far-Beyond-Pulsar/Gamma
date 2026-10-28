@@ -1,5 +1,49 @@
 # Changelog
 
+## Unreleased
+
+### Event namespaces
+
+Dynamic (and derived) events can live in an explicit namespace, so engine
+plugins can't collide with each other or with the game.
+
+* Everything declared without a namespace is in the **main namespace** and
+  behaves exactly as before: same ids, same wire format, same lookups.
+* `"main"` and `""` are reserved: the main namespace can't be reached by
+  naming it (`EventDescriptor::dynamic_in` and registration reject them,
+  `descriptor_by_name_in("main", ..)` finds nothing).
+* New: `#[pulsar_event(namespace = "...")]`, `EventDescriptor::{dynamic_in,
+  new_in}`, `dynamic_event_id_in`, `descriptor_by_name_in`, `descriptors_in`,
+  `all_descriptors`, `namespaces`, `RegistryError::ReservedNamespace`.
+  `descriptors()` and `descriptor_by_name()` remain main-only.
+* Namespaced descriptors use wire version 2; main descriptors still encode as
+  version 1. `EventDescriptor` gained a public `namespace` field (use the
+  constructors rather than struct literals).
+
+### Subscription batches
+
+* `subscribe_batch` and `subscribe_batch_dyn` install handlers with one
+  subscriber-table write; `SubscriptionBatch` and
+  `SyncSubscriptionBatch` unsubscribe all remaining handlers on drop.
+* `unsubscribe_many` removes tokens in one table write. Single-subscription
+  removal now locates its entry by binary search over priority and token.
+
+### Deferred payload and delivery path
+
+* Deferred typed events up to 32 bytes with alignment up to 16 are stored
+  inline; larger payloads retain the pooled host-buffer path.
+* Pooled typed-to-dynamic conversion now lends the converted event directly
+  to handlers, avoiding a per-event `Arc` allocation.
+* With the `parallel` feature, `SyncEventBus` can opt into deferred delivery
+  across independent channels. Same-channel FIFO and next-round handling are
+  preserved; the option is off by default.
+
+### Deferred flush behavior
+
+* The README now calls out that exhausting the configured flush-round limit
+  leaves follow-up events queued for a later flush.
+
+
 ## 0.2.0
 
 Gamma v2: plugin-safe dispatch, subscription handles, deferred delivery,

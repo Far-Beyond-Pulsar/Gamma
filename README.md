@@ -85,6 +85,14 @@ many remain. A `flush` called while another flush of the same bus is running
 `already_flushing`. `flush` swaps the queue out under the lock and delivers
 after releasing it, so publishers never wait for handlers.
 
+The round limit is a semantic difference from an unbounded event chain: when
+the limit is reached, queued follow-up events remain pending until the next
+`flush`, so a deep but finite cascade can continue on a later frame. The limit
+bounds lock and stack pressure and prevents runaway re-entrant event chains.
+Raise it with `set_max_flush_rounds` or `flush_with_limit` when a caller needs
+more generations in one call; check `FlushReport::hit_round_limit` and
+`FlushReport::remaining` to detect deferred work.
+
 Immediate `publish` inside a handler still runs inline (re-entrant); prefer
 `publish_deferred` from handlers, especially while holding engine locks.
 
@@ -240,8 +248,38 @@ only, thread spawn included):
 | 4 | 864 µs | 4.6 M events/s |
 | 8 | 1.86 ms | 4.3 M events/s |
 
-The deferred queue is one `Mutex<VecDeque>`, so throughput drops under
-contention. It is held only for the push and for the swap in `flush`.
+The deferred queue is split across 16 channel-hash shards. Publishers lock
+only their shard, and `flush` drains shards one at a time before restoring
+publish order from sequence stamps. The locks are held for queue insertion or
+batch extraction, never while handlers run.
+
+With the `parallel` feature, `SyncEventBus::set_parallel_flush(true)` opts into
+parallel delivery across independent channels. Events for one channel stay
+sequential and FIFO, and handlers that enqueue follow-up work are handled in a
+later flush round. Parallel flush is off by default.
+
+#### Recent release-mode measurements
+
+Criterion runs on a Ryzen 9 9950X3D, Windows 11, 10 samples, 1 s warm-up and
+3 s measurement per case. Queue results compare the single-queue parent
+(`c8c5286`) to the sharding-only commit (`bab88c6`) using the same harness;
+batch and parallel-flush results measure this branch.
+
+| Workload | Before | After | Change |
+|---|---:|---:|---:|
+| Queue pipeline, 10k events, 8 producers | 1.90 ms | 0.95 ms | 2.0× faster |
+| Queue pipeline, 100k events, 8 producers | 23.53 ms | 9.53 ms | 2.5× faster |
+| Queue pipeline, 100k events, 4 producers | 13.73 ms | 8.63 ms | 1.6× faster |
+| Batch subscribe + drop, 2k handlers | 394 µs | 335 µs | 15% less time |
+| Parallel flush, 512 events / 8 channels / busy handlers | 2.76 ms | 495 µs | 5.6× faster |
+
+The sharded queue's single-producer 10k result was near parity (722 µs vs.
+771 µs); the largest queue gains were under producer contention. The warmed
+allocation test also delivered 10k small typed-to-dynamic events with **zero
+Gamma allocations** across publish and flush. Event construction allocations
+owned by callers are outside that measurement. Run `cargo bench -p gamma-core
+--bench queue_pipeline` and `cargo bench -p gamma-core --bench throughput
+--all-features` to reproduce the timings.
 
 ### Compared with 0.1
 

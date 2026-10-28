@@ -124,6 +124,13 @@ pub trait DynField: Sized {
     /// Convert from a dynamic value; `None` on a type mismatch or an
     /// out-of-range integer.
     fn from_dyn_value(value: &DynValue) -> Option<Self>;
+    /// Write the value into a pooled sink: allocation-free when the sink's
+    /// buffers are primed. The default writes [`to_dyn_value`], which for
+    /// buffer-backed fields allocates; `String` and `Vec<u8>` override it
+    /// to reuse the sink's pooled buffers instead.
+    fn to_dyn_into(&self, sink: &mut DynEventSink) {
+        sink.push_fixed(self.to_dyn_value());
+    }
 }
 
 impl DynField for bool {
@@ -189,6 +196,9 @@ impl DynField for String {
     fn to_dyn_value(&self) -> DynValue {
         DynValue::Str(self.clone())
     }
+    fn to_dyn_into(&self, sink: &mut DynEventSink) {
+        sink.push_pooled_str(self);
+    }
     fn from_dyn_value(value: &DynValue) -> Option<Self> {
         match value {
             DynValue::Str(s) => Some(s.clone()),
@@ -201,6 +211,9 @@ impl DynField for Vec<u8> {
     const FIELD_TYPE: FieldType = FieldType::Bytes;
     fn to_dyn_value(&self) -> DynValue {
         DynValue::Bytes(self.clone())
+    }
+    fn to_dyn_into(&self, sink: &mut DynEventSink) {
+        sink.push_pooled_bytes(self);
     }
     fn from_dyn_value(value: &DynValue) -> Option<Self> {
         match value {
@@ -381,6 +394,97 @@ const WIRE_VERSION: u8 = 1;
 /// Descriptor layout with a namespace string (main-namespace descriptors
 /// keep using [`WIRE_VERSION`]).
 const WIRE_VERSION_NS: u8 = 2;
+
+// ---------------------------------------------------------------------------
+// DynEventSink: building reflective dynamic events from pooled buffers
+// ---------------------------------------------------------------------------
+
+/// Builds a [`DynEvent`] field by field, taking its buffers from a pool.
+///
+/// [`DynField::to_dyn_into`] writes with no allocations once the sink's
+/// buffers are primed: fixed-width fields go straight into the fields
+/// vector, and `String` / `Vec<u8>` fields are reused (`push_pooled_str`).
+/// The buffers are returned to the pool by whoever delivered the event
+/// (the core's `Pools`).
+///
+/// A sink is a one-shot builder: obtain one (usually from a pool), write
+/// the fields, then [`finish`](Self::finish) — which also returns what the
+/// sink did not use, for the pool.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct DynEventSink {
+    /// The event's stable id, set by the writer before the fields.
+    pub id: u64,
+    /// Field values built so far, in descriptor order.
+    fields: Vec<DynValue>,
+    /// Pooled spare strings, popped one per string field.
+    strings: Vec<String>,
+    /// Pooled spare byte vectors, popped one per bytes field.
+    bytes: Vec<Vec<u8>>,
+}
+
+/// Buffers a sink did not use; back into the pool.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SinkSpares {
+    pub(crate) strings: Vec<String>,
+    pub(crate) bytes: Vec<Vec<u8>>,
+}
+
+impl DynEventSink {
+    /// A sink with no pooled buffers (al conversions allocate fresh ones).
+    pub(crate) fn empty() -> Self {
+        Self::default()
+    }
+
+    /// Add pooled buffers to the sink, done by `Pools` when it creates one.
+    pub(crate) fn give_spares(&mut self, strings: Vec<String>, bytes: Vec<Vec<u8>>) {
+        self.strings = strings;
+        self.bytes = bytes;
+    }
+
+    /// Use a pooled fields vector for this event's values.
+    pub(crate) fn give_fields(&mut self, fields: Vec<DynValue>) {
+        self.fields = fields;
+    }
+
+    /// Pooled string in place: clear it and copy `value` in.
+    #[inline]
+    pub(crate) fn push_pooled_str(&mut self, value: &str) {
+        let mut s = self.strings.pop().unwrap_or_default();
+        s.clear();
+        s.push_str(value);
+        self.fields.push(DynValue::Str(s));
+    }
+
+    /// Pooled byte vector in place: clear it and copy `value` in.
+    #[inline]
+    pub(crate) fn push_pooled_bytes(&mut self, value: &[u8]) {
+        let mut b = self.bytes.pop().unwrap_or_default();
+        b.clear();
+        b.extend_from_slice(value);
+        self.fields.push(DynValue::Bytes(b));
+    }
+
+    /// Fixed-width field push (no allocation).
+    #[inline]
+    pub(crate) fn push_fixed(&mut self, value: DynValue) {
+        self.fields.push(value);
+    }
+
+    /// Build the event; returns what the sink did not use for the pool.
+    pub(crate) fn finish(mut self) -> (Option<DynEvent>, SinkSpares) {
+        let event = Some(DynEvent {
+            id: self.id,
+            fields: std::mem::take(&mut self.fields),
+        });
+        (
+            event,
+            SinkSpares {
+                strings: std::mem::take(&mut self.strings),
+                bytes: std::mem::take(&mut self.bytes),
+            },
+        )
+    }
+}
 
 impl DynEvent {
     /// A new dynamic event.

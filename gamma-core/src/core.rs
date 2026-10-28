@@ -17,9 +17,12 @@
 
 use std::alloc::Layout;
 use std::cell::RefCell;
+#[cfg(feature = "parallel")]
+use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::marker::PhantomData;
+use std::mem::MaybeUninit;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -28,8 +31,16 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use rustc_hash::FxHashMap;
 
+use crate::dynamic::SinkSpares;
 use crate::ffi::{ForeignHandler, RawDropFn, RawSink, RawToDynFn};
-use crate::{Channel, DynEvent, DynEventError, Event, EventDescriptor, RegistryError};
+use crate::{
+    Channel, DynEvent, DynEventError, DynEventSink, DynValue, Event, EventDescriptor, RegistryError,
+};
+
+/// Pool cap defaults: 64 recycled typed buffers, 256 dynamic field buffers
+/// per shape (`Pools::buffers_cap` / `dyn_cap`).
+pub(crate) const DEFAULT_POOL_BUFFERS_CAP: usize = 64;
+pub(crate) const DEFAULT_POOL_DYN_CAP: usize = 256;
 
 pub(crate) type Key = (u64, Channel);
 
@@ -108,8 +119,9 @@ impl<E: Clone> SharedList<E> for Arc<Vec<E>> {
 /// How to turn a typed payload into a [`DynEvent`].
 pub(crate) enum ToDyn {
     None,
-    /// `T::to_dyn` from this copy of gamma-core.
-    Local(unsafe fn(*const u8) -> Option<DynEvent>),
+    /// Writes this copy of gamma-core's event into a [`DynEventSink`] via
+    /// `Event::to_dyn_into` (equivalent to `T::to_dyn`, pooled-capable).
+    Local(unsafe fn(*const u8, &mut DynEventSink) -> bool),
     /// A plugin's encoder (writes the wire format into a sink).
     Foreign(RawToDynFn),
 }
@@ -123,13 +135,21 @@ impl ToDyn {
         }
     }
 
+    /// The dynamic form with fresh buffers (no pool in reach).
+    ///
     /// # Safety
     /// `ptr` must point to a live value of the type this converter was made for.
-    unsafe fn convert(&self, ptr: *const u8) -> Option<DynEvent> {
+    pub(crate) fn convert(&self, ptr: *const u8) -> Option<DynEvent> {
         match self {
             ToDyn::None => None,
             // SAFETY: forwarded from the caller.
-            ToDyn::Local(f) => unsafe { f(ptr) },
+            ToDyn::Local(f) => unsafe {
+                let mut sink = DynEventSink::empty();
+                let ok = f(ptr, &mut sink);
+                let (event, spares) = sink.finish();
+                drop(spares);
+                if ok { event } else { None }
+            },
             ToDyn::Foreign(f) => {
                 let mut buf: Vec<u8> = Vec::new();
                 let mut sink = RawSink {
@@ -144,9 +164,9 @@ impl ToDyn {
     }
 }
 
-unsafe fn to_dyn_thunk<T: Event>(ptr: *const u8) -> Option<DynEvent> {
+unsafe fn to_dyn_thunk<T: Event>(ptr: *const u8, sink: &mut DynEventSink) -> bool {
     // SAFETY: only built by `ToDyn::of::<T>` and called with a `*const T`.
-    unsafe { &*ptr.cast::<T>() }.to_dyn()
+    unsafe { &*ptr.cast::<T>() }.to_dyn_into(sink)
 }
 
 /// The sink a plugin's `to_dyn` writes into. The bytes are copied into a
@@ -181,6 +201,9 @@ pub(crate) struct EventView<'a> {
     pub channel: Channel,
     pub payload: Payload<'a>,
     dyn_cache: OnceLock<Option<DynEvent>>,
+    /// The pooled dynamic form, borrowed for this dispatch so the flush can
+    /// recycle its buffers after delivery without an `Arc` allocation.
+    pub(crate) dyn_form: Option<&'a DynEvent>,
     enc_cache: OnceLock<Option<Vec<u8>>>,
 }
 
@@ -219,6 +242,7 @@ impl<'a> EventView<'a> {
                 to_dyn,
             },
             dyn_cache: OnceLock::new(),
+            dyn_form: None,
             enc_cache: OnceLock::new(),
         }
     }
@@ -229,19 +253,25 @@ impl<'a> EventView<'a> {
             channel,
             payload: Payload::Dyn(ev),
             dyn_cache: OnceLock::new(),
+            dyn_form: None,
             enc_cache: OnceLock::new(),
         }
     }
 
     /// The event as a [`DynEvent`], if it is dynamic or its type is reflected.
     pub(crate) fn as_dyn(&self) -> Option<&DynEvent> {
+        // The flush built the pooled form; deliver that.
+        if let Payload::Typed { .. } = &self.payload {
+            if let Some(f) = self.dyn_form {
+                return Some(f);
+            }
+        }
         match &self.payload {
             Payload::Dyn(d) => Some(d),
             // SAFETY: `ptr` is the live value this view was built from.
-            Payload::Typed { ptr, to_dyn, .. } => self
-                .dyn_cache
-                .get_or_init(|| unsafe { to_dyn.convert(*ptr) })
-                .as_ref(),
+            Payload::Typed { ptr, to_dyn, .. } => {
+                self.dyn_cache.get_or_init(|| to_dyn.convert(*ptr)).as_ref()
+            }
         }
     }
 
@@ -261,6 +291,11 @@ impl<'a> EventView<'a> {
 /// created them (see `ForeignHandler` for plugin subscribers).
 pub(crate) trait ErasedHandler {
     fn deliver(&self, ev: &EventView<'_>);
+    /// `true` when this handler invokes its callback with the *dynamic*
+    /// form (so the flush can build it from pooled buffers up front).
+    fn is_dyn(&self) -> bool {
+        false
+    }
 }
 
 /// The handler object type stored by one bus flavour, and the
@@ -361,6 +396,10 @@ impl<F: Fn(&DynEvent)> ErasedHandler for DynHandler<F> {
             (self.0)(d);
         }
     }
+
+    fn is_dyn(&self) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -373,11 +412,21 @@ enum DropFn {
     Foreign(RawDropFn),
 }
 
-/// An owned typed event in a host-allocated buffer. Its *contents* are
-/// dropped by the publisher's drop function (so a plugin's heap data is
-/// freed by the plugin); the buffer itself is the host's.
+/// Small events live inline in the queue entry. Larger values use a host
+/// buffer, optionally recycled by the core. Their contents are dropped by
+/// the publisher's drop function so plugin-owned data uses plugin drop glue.
+#[repr(align(16))]
+struct InlineStorage([MaybeUninit<u8>; INLINE_EVENT_BYTES]);
+
+enum TypedStorage {
+    Inline(InlineStorage),
+    Heap(NonNull<u8>),
+}
+
+const INLINE_EVENT_BYTES: usize = 32;
+
 pub(crate) struct OwnedTyped {
-    ptr: NonNull<u8>,
+    storage: TypedStorage,
     layout: Layout,
     drop_fn: DropFn,
     to_dyn: ToDyn,
@@ -388,11 +437,34 @@ pub(crate) struct OwnedTyped {
 unsafe impl Send for OwnedTyped {}
 
 unsafe fn drop_thunk<T>(p: *mut u8) {
-    // SAFETY: called once on the buffer `OwnedTyped::new::<T>` wrote.
+    // SAFETY: called once on the buffer the pooled constructor wrote.
     unsafe { std::ptr::drop_in_place(p.cast::<T>()) }
 }
 
 impl OwnedTyped {
+    pub(crate) fn can_inline(layout: &Layout) -> bool {
+        layout.size() <= INLINE_EVENT_BYTES && layout.align() <= 16
+    }
+
+    fn allocate_storage(layout: &Layout, buffer: Option<NonNull<u8>>) -> TypedStorage {
+        if Self::can_inline(layout) {
+            TypedStorage::Inline(InlineStorage(
+                [const { MaybeUninit::uninit() }; INLINE_EVENT_BYTES],
+            ))
+        } else if let Some(ptr) = buffer.filter(|_| layout.size() != 0) {
+            TypedStorage::Heap(ptr)
+        } else {
+            TypedStorage::Heap(Self::alloc(*layout))
+        }
+    }
+
+    fn ptr(&self) -> *mut u8 {
+        match &self.storage {
+            TypedStorage::Inline(storage) => storage.0.as_ptr().cast_mut().cast(),
+            TypedStorage::Heap(ptr) => ptr.as_ptr(),
+        }
+    }
+
     fn alloc(layout: Layout) -> NonNull<u8> {
         if layout.size() == 0 {
             // Dangling but aligned, never dereferenced for more than 0 bytes.
@@ -404,13 +476,23 @@ impl OwnedTyped {
         NonNull::new(p).unwrap_or_else(|| std::alloc::handle_alloc_error(layout))
     }
 
-    pub(crate) fn new<T: Event>(value: T) -> Self {
+    /// Take the value with a pooled buffer instead of a fresh allocation.
+    ///
+    /// # Safety
+    /// `buffer` must be a live allocation of exactly `T`'s layout whose
+    /// contents were already dropped, or `None`.
+    pub(crate) unsafe fn with_buffer<T: Event>(value: T, buffer: Option<NonNull<u8>>) -> Self {
         let layout = Layout::new::<T>();
-        let ptr = Self::alloc(layout);
-        // SAFETY: freshly allocated for `T`'s layout.
-        unsafe { ptr.as_ptr().cast::<T>().write(value) };
+        let mut storage = Self::allocate_storage(&layout, buffer);
+        let ptr = match &mut storage {
+            TypedStorage::Inline(storage) => storage.0.as_mut_ptr().cast::<u8>(),
+            TypedStorage::Heap(ptr) => ptr.as_ptr(),
+        };
+        // SAFETY: the buffer holds `T`'s layout (contents already dropped, so
+        // writing over them is a plain memory write, not a double drop).
+        unsafe { ptr.cast::<T>().write(value) };
         Self {
-            ptr,
+            storage,
             layout,
             drop_fn: if std::mem::needs_drop::<T>() {
                 DropFn::Local(drop_thunk::<T>)
@@ -421,27 +503,56 @@ impl OwnedTyped {
         }
     }
 
+    /// Drop the value, keep the buffer for the pool.
+    ///
+    /// # Safety
+    /// The buffer must not be used again until it is pooled or freed; this
+    /// consumes the event (its drop fn runs exactly once here).
+    unsafe fn drop_contents_keep_buffer(self) -> Option<(NonNull<u8>, Layout)> {
+        let this = std::mem::ManuallyDrop::new(self);
+        let ptr = this.ptr();
+        // SAFETY: runs once for the live value in the buffer.
+        unsafe {
+            match this.drop_fn {
+                DropFn::None => {}
+                DropFn::Local(f) => f(ptr),
+                DropFn::Foreign(f) => f(ptr),
+            }
+        }
+        match &this.storage {
+            TypedStorage::Heap(buffer) if this.layout.size() != 0 => Some((*buffer, this.layout)),
+            _ => None,
+        }
+    }
+
     /// Move a plugin's value into a host buffer (bitwise, like any Rust move).
     ///
     /// # Safety
     /// `src` must point to `size` readable bytes of a value the caller gives
     /// up ownership of; `drop_fn` and `to_dyn` must stay callable until the
-    /// value is delivered or dropped.
+    /// value is delivered or dropped. `buffer` must be a live allocation of
+    /// exactly this `(size, align)` layout whose contents were already
+    /// dropped, or `None` to allocate.
     pub(crate) unsafe fn from_foreign(
         src: *const u8,
         size: usize,
         align: usize,
         drop_fn: Option<RawDropFn>,
         to_dyn: Option<RawToDynFn>,
+        buffer: Option<NonNull<u8>>,
     ) -> Option<Self> {
         let layout = Layout::from_size_align(size, align).ok()?;
-        let ptr = Self::alloc(layout);
+        let mut storage = Self::allocate_storage(&layout, buffer);
+        let ptr = match &mut storage {
+            TypedStorage::Inline(storage) => storage.0.as_mut_ptr().cast::<u8>(),
+            TypedStorage::Heap(ptr) => ptr.as_ptr(),
+        };
         if size != 0 {
             // SAFETY: caller guarantees `size` readable bytes; `ptr` has room.
-            unsafe { std::ptr::copy_nonoverlapping(src, ptr.as_ptr(), size) };
+            unsafe { std::ptr::copy_nonoverlapping(src, ptr, size) };
         }
         Some(Self {
-            ptr,
+            storage,
             layout,
             drop_fn: drop_fn.map_or(DropFn::None, DropFn::Foreign),
             to_dyn: to_dyn.map_or(ToDyn::None, ToDyn::Foreign),
@@ -451,15 +562,18 @@ impl OwnedTyped {
 
 impl Drop for OwnedTyped {
     fn drop(&mut self) {
+        let ptr = self.ptr();
         // SAFETY: the buffer holds a live value; each drop fn runs once.
         unsafe {
             match self.drop_fn {
                 DropFn::None => {}
-                DropFn::Local(f) => f(self.ptr.as_ptr()),
-                DropFn::Foreign(f) => f(self.ptr.as_ptr()),
+                DropFn::Local(f) => f(ptr),
+                DropFn::Foreign(f) => f(ptr),
             }
-            if self.layout.size() != 0 {
-                std::alloc::dealloc(self.ptr.as_ptr(), self.layout);
+            if let TypedStorage::Heap(buffer) = &self.storage {
+                if self.layout.size() != 0 {
+                    std::alloc::dealloc(buffer.as_ptr(), self.layout);
+                }
             }
         }
     }
@@ -513,16 +627,195 @@ pub(crate) struct Registry {
 
 pub(crate) struct Table<H: ?Sized + Slot> {
     lists: FxHashMap<Key, H::List>,
-    tokens: FxHashMap<u64, Key>,
+    tokens: FxHashMap<u64, (Key, i32)>,
 }
+
+type DroppedSubscriptions<H> = (Option<Arc<Entry<H>>>, Option<<H as Slot>::List>);
 
 pub(crate) struct Core<H: ?Sized + Slot> {
     table: H::Lock<Table<H>>,
-    queue: H::Mutex<VecDeque<Queued>>,
+    /// Deferred events, sharded per channel (`queue_shard`). Each queued
+    /// event carries its global sequence number; flush merging restores the
+    /// publish order across shards.
+    queue: [H::Mutex<Shard>; QUEUE_SHARDS],
+    /// The flush side's merge buffer: shard batches drained into it and
+    /// ordered by sequence number. Touched only while the flush's
+    /// `flushing` flag excludes every other flush and nested flushes are
+    /// refused, so it is single-owner for the whole flush; the owner swaps
+    /// contents in and out, keeping capacity across flushes.
+    batch_scratch: H::Mutex<Vec<(u64, Queued)>>,
+    /// Stamps every queued event with its publish sequence.
+    next_seq: AtomicU64,
+    /// Recycled payload buffers (typed layouts and dynamic field buffers).
+    pools: H::Mutex<Pools>,
     registry: H::Lock<Registry>,
     next_token: AtomicU64,
     flushing: AtomicBool,
     max_rounds: AtomicU32,
+    #[cfg(feature = "parallel")]
+    parallel_flush: AtomicBool,
+}
+
+// ---------------------------------------------------------------------------
+// Deferred queue
+// ---------------------------------------------------------------------------
+
+/// The deferred queue is sharded per channel (see [`queue_shard`]) so a
+/// publish locks only its own channel's shard. The cross-shard publish order
+/// is restored at flush time by the sequence number stamped on each queued
+/// event, so the delivery contract stays exactly what it was with one queue:
+/// published order across everything.
+const QUEUE_SHARDS: usize = 16;
+
+/// The shard holding the deferred queue for `channel`. Cheap and stable:
+/// two publishes of the same channel always land on the same shard (kept in
+/// that shard's FIFO), independent channels mostly split across shards.
+fn queue_shard(channel: Channel) -> usize {
+    let (discriminant, value) = match channel {
+        Channel::Global => (0u64, 0),
+        Channel::Entity(value) => (1, value),
+        Channel::Class(value) => (2, value),
+    };
+    // FNV-1a over the discriminant then the value.
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    hash = (hash ^ discriminant).wrapping_mul(0x100_0000_01b3);
+    hash = (hash ^ value).wrapping_mul(0x100_0000_01b3);
+    (hash % QUEUE_SHARDS as u64) as usize
+}
+
+/// One shard of the deferred queue: channel ordered events, in publish order
+/// (the sequence stamp restores the global order at flush time).
+#[derive(Default)]
+struct Shard(VecDeque<(u64, Queued)>);
+
+// ---------------------------------------------------------------------------
+// Payload pools
+// ---------------------------------------------------------------------------
+
+/// Recycled payloads: typed event buffers keyed by `(size, align)` and the
+/// field buffers of dynamic events. Delivery round-trips pool to pool (see
+/// `dispatch_owned` / `drain`), so a full pipeline stop hits nothing rather
+/// than a new buffer transaction.
+///
+/// Caps bound the memory a busy pipeline can hold: pooled buffers past a cap
+/// are dropped rather than stored. Buffers are deallocated (contents were
+/// dropped at harvest time) with the core.
+pub(crate) struct Pools {
+    /// Typed payload buffers by `(size, align)`; each buffer holds no value
+    /// (its contents were dropped before pooling).
+    buffers: FxHashMap<(usize, usize), Vec<NonNull<u8>>>,
+    buffers_len: usize,
+    buffers_cap: usize,
+    /// Fields vectors of dynamic events (`DynEvent::fields`).
+    fields: Vec<Vec<crate::DynValue>>,
+    /// `DynValue::Str` buffers, seeded from delivered events.
+    strings: Vec<String>,
+    /// `DynValue::Bytes` buffers.
+    bytes: Vec<Vec<u8>>,
+    dyn_cap: usize,
+}
+
+impl Pools {
+    fn new(buffers_cap: usize, dyn_cap: usize) -> Self {
+        Self {
+            buffers: FxHashMap::default(),
+            buffers_len: 0,
+            buffers_cap,
+            fields: Vec::new(),
+            strings: Vec::new(),
+            bytes: Vec::new(),
+            dyn_cap,
+        }
+    }
+
+    /// A typed payload buffer of exactly this layout; `None` empties it.
+    pub(crate) fn take_buffer(&mut self, layout: &Layout) -> Option<NonNull<u8>> {
+        if layout.size() == 0 {
+            return None;
+        }
+        let key = (layout.size(), layout.align());
+        match self.buffers.get_mut(&key).and_then(Vec::pop) {
+            Some(p) => {
+                self.buffers_len -= 1;
+                Some(p)
+            }
+            None => None,
+        }
+    }
+
+    /// Recycle a typed payload buffer (contents were dropped by the caller).
+    pub(crate) fn put_buffer(&mut self, ptr: NonNull<u8>, layout: Layout) {
+        if layout.size() == 0 {
+            return;
+        }
+        if self.buffers_len >= self.buffers_cap {
+            // A full pool owns no slot for this buffer; release it instead
+            // of silently leaking it.
+            unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
+            return;
+        }
+        self.buffers
+            .entry((layout.size(), layout.align()))
+            .or_default()
+            .push(ptr);
+        self.buffers_len += 1;
+    }
+
+    pub(crate) fn take_fields(&mut self) -> Vec<crate::DynValue> {
+        self.fields.pop().unwrap_or_default()
+    }
+
+    /// Recycle the fields vector; already emptied before being offered here.
+    pub(crate) fn put_fields(&mut self, buf: Vec<crate::DynValue>) {
+        if self.fields.len() < self.dyn_cap {
+            self.fields.push(buf);
+        }
+    }
+
+    pub(crate) fn put_string(&mut self, s: String) {
+        if self.strings.len() < self.dyn_cap {
+            self.strings.push(s);
+        }
+    }
+
+    pub(crate) fn put_bytes(&mut self, b: Vec<u8>) {
+        if self.bytes.len() < self.dyn_cap {
+            self.bytes.push(b);
+        }
+    }
+
+    /// Recycle a delivered dynamic event: `Str`/`Bytes` buffers split out,
+    /// the `fields` vector emptied in place and reused.
+    pub(crate) fn put_dyn_fields(&mut self, mut fields: Vec<crate::DynValue>) {
+        for v in fields.drain(..) {
+            match v {
+                DynValue::Str(s) => self.put_string(s),
+                DynValue::Bytes(b) => self.put_bytes(b),
+                _ => drop(v),
+            }
+        }
+        self.put_fields(fields);
+    }
+}
+
+// SAFETY: a pool is only reachable through its core's lock, and its raw
+// buffers are owned by exactly one pool (as documented on `put_buffer`).
+// The same thread-boundary promise the buffers' live values carry as
+// `OwnedTyped` applies here.
+unsafe impl Send for Pools {}
+
+impl Drop for Pools {
+    fn drop(&mut self) {
+        for (key, buf) in self.buffers.drain() {
+            let layout = std::alloc::Layout::from_size_align(key.0, key.1).expect("pooled layout");
+            for p in buf {
+                // SAFETY: buffers pooled here were allocated with this layout.
+                unsafe {
+                    std::alloc::dealloc(p.as_ptr(), layout);
+                }
+            }
+        }
+    }
 }
 
 impl<H: ?Sized + Slot> Core<H> {
@@ -532,11 +825,16 @@ impl<H: ?Sized + Slot> Core<H> {
                 lists: FxHashMap::default(),
                 tokens: FxHashMap::default(),
             }),
-            queue: Lock::new(VecDeque::new()),
+            queue: std::array::from_fn(|_| Lock::new(Shard::default())),
+            batch_scratch: Lock::new(Vec::new()),
+            next_seq: AtomicU64::new(0),
+            pools: Lock::new(Pools::new(DEFAULT_POOL_BUFFERS_CAP, DEFAULT_POOL_DYN_CAP)),
             registry: Lock::new(Registry::default()),
             next_token: AtomicU64::new(1),
             flushing: AtomicBool::new(false),
             max_rounds: AtomicU32::new(crate::DEFAULT_MAX_FLUSH_ROUNDS),
+            #[cfg(feature = "parallel")]
+            parallel_flush: AtomicBool::new(false),
         }
     }
 
@@ -549,7 +847,7 @@ impl<H: ?Sized + Slot> Core<H> {
     pub(crate) fn insert(&self, id: u64, channel: Channel, e: Arc<Entry<H>>) {
         let key = (id, channel);
         self.table.write(|t| {
-            t.tokens.insert(e.token, key);
+            t.tokens.insert(e.token, (key, e.priority));
             let list = t.lists.entry(key).or_default().make_mut();
             // Tokens are increasing, so the new entry goes after every entry
             // of higher or equal priority: stable order for ties.
@@ -558,16 +856,50 @@ impl<H: ?Sized + Slot> Core<H> {
         })
     }
 
+    /// Insert many handlers in one lock round and one CoW clone. Handlers
+    /// for the same (event, channel) key keep their batch order after
+    /// higher- and equal-priority entries.
+    pub(crate) fn insert_many(&self, items: Vec<(u64, Channel, Arc<Entry<H>>)>) {
+        let items: Vec<(Key, Arc<Entry<H>>)> = items
+            .into_iter()
+            .map(|(id, channel, e)| ((id, channel), e))
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        self.table.write(|t| {
+            for (key, e) in items {
+                t.tokens.insert(e.token, (key, e.priority));
+                let list = t.lists.entry(key).or_default().make_mut();
+                let pos = list.partition_point(|x| x.priority >= e.priority);
+                list.insert(pos, e);
+            }
+        })
+    }
+
+    fn find_pos(list: &[Arc<Entry<H>>], token: u64, priority: i32) -> usize {
+        list.partition_point(|x| {
+            x.priority > priority || (x.priority == priority && x.token < token)
+        })
+    }
+
+    /// Remove one subscription in one write lock round. The entry's slot is
+    /// found by binary search over its (priority, token) order.
     pub(crate) fn remove(&self, token: u64) -> bool {
         let (removed, emptied) = self.table.write(|t| {
-            let Some(key) = t.tokens.remove(&token) else {
+            let Some((key, priority)) = t.tokens.remove(&token) else {
                 return (None, None);
             };
             let Some(list) = t.lists.get_mut(&key) else {
                 return (None, None);
             };
             let v = list.make_mut();
-            let removed = v.iter().position(|e| e.token == token).map(|i| v.remove(i));
+            let pos = Self::find_pos(v, token, priority);
+            let removed = if v.get(pos).is_some_and(|e| e.token == token) {
+                Some(v.remove(pos))
+            } else {
+                None
+            };
             if let Some(e) = &removed {
                 e.alive.store(false, Ordering::Release);
             }
@@ -584,6 +916,45 @@ impl<H: ?Sized + Slot> Core<H> {
         drop(removed);
         drop(emptied);
         found
+    }
+
+    /// Remove many subscriptions in one write lock round (one CoW clone per
+    /// list touched). Returns how many tokens were still subscribed.
+    ///
+    /// Dropped entries leave the lock after the whole batch; handler drops
+    /// that unsubscribe or publish therefore run outside the lock.
+    pub(crate) fn remove_many(&self, tokens: &[u64]) -> usize {
+        if tokens.is_empty() {
+            return 0;
+        }
+        let mut dropped: Vec<DroppedSubscriptions<H>> = Vec::new();
+        let count = self.table.write(|t| {
+            let mut count = 0;
+            for &token in tokens {
+                let Some((key, priority)) = t.tokens.remove(&token) else {
+                    continue;
+                };
+                let Some(list) = t.lists.get_mut(&key) else {
+                    continue;
+                };
+                let v = list.make_mut();
+                let pos = Self::find_pos(v, token, priority);
+                if v.get(pos).is_some_and(|e| e.token == token) {
+                    let e = v.remove(pos);
+                    e.alive.store(false, Ordering::Release);
+                    dropped.push((Some(e), None));
+                    count += 1;
+                    if v.is_empty() {
+                        dropped.push((None, t.lists.remove(&key)));
+                    }
+                } else if v.is_empty() {
+                    dropped.push((None, t.lists.remove(&key)));
+                }
+            }
+            count
+        });
+        drop(dropped);
+        count
     }
 
     pub(crate) fn is_subscribed(&self, token: u64) -> bool {
@@ -669,30 +1040,135 @@ impl<H: ?Sized + Slot> Core<H> {
         }
     }
 
-    fn dispatch_owned(&self, q: &Queued) {
-        match &q.payload {
-            OwnedPayload::Typed { id, value } => self.dispatch(*id, q.channel, || {
-                EventView::raw_typed(
-                    *id,
-                    q.channel,
-                    value.ptr.as_ptr(),
-                    value.layout.size(),
-                    value.layout.align(),
-                    &value.to_dyn,
-                )
-            }),
+    /// The dynamic form of a queued typed payload, written into pooled
+    /// buffers so delivering to dynamic subscribers allocates nothing once
+    /// the pool is primed (first use allocates, later events reuse the
+    /// buffers the previous event returned).
+    ///
+    /// Borrowed by the dispatch view so its buffers can be recycled after
+    /// the subscribers finish, without allocating a shared `Arc` per event.
+    fn build_pooled_dyn(&self, event: &OwnedTyped) -> Option<DynEvent> {
+        let mut sink = self.pools.write(|p| {
+            let mut sink = DynEventSink::empty();
+            sink.give_fields(p.take_fields());
+            sink.give_spares(std::mem::take(&mut p.strings), std::mem::take(&mut p.bytes));
+            sink
+        });
+        // SAFETY: `ptr` is the live value `OwnedTyped` holds until delivery;
+        // the thunk is the one built for its exact type.
+        let ok = unsafe {
+            match &event.to_dyn {
+                ToDyn::Local(f) => f(event.ptr(), &mut sink),
+                _ => false,
+            }
+        };
+        let (event_dyn, spares) = sink.finish();
+        self.put_spares(spares);
+        if ok { event_dyn } else { None }
+    }
+
+    /// Unused sink buffers return to the pool.
+    fn put_spares(&self, spares: SinkSpares) {
+        self.pools.write(|p| {
+            p.strings = spares.strings;
+            p.bytes = spares.bytes;
+            p.strings.truncate(p.dyn_cap);
+            p.bytes.truncate(p.dyn_cap);
+        });
+    }
+
+    /// Return a delivered queued event's buffers to the pools. Contents are
+    /// dropped first (the drop-once delivery contract), the memory is kept.
+    #[inline]
+    fn recycle_queued(&self, q: Queued) {
+        match q.payload {
+            OwnedPayload::Typed { value, .. } => {
+                // SAFETY: the buffer is dropped here exactly once and pooled
+                // (or handed to the allocator) right after; never reused while
+                // drop_fn runs.
+                if let Some((ptr, layout)) = unsafe { value.drop_contents_keep_buffer() } {
+                    self.pools.write(|p| p.put_buffer(ptr, layout));
+                }
+            }
             OwnedPayload::Dyn(d) => {
-                self.dispatch(d.id, q.channel, || EventView::dynamic(q.channel, d))
+                self.pools.write(|p| p.put_dyn_fields(d.fields));
             }
         }
     }
 
+    pub(crate) fn dispatch_owned(&self, q: &Queued) {
+        let mut prebuilt: Option<DynEvent> = None;
+        {
+            let view = match &q.payload {
+                OwnedPayload::Typed { id, value } => {
+                    // Dynamic subscribers in this channel's list get the
+                    // pooled dynamic form up front; dispatch never converts
+                    // lazily.
+                    if let Some(list) = self.snapshot((*id, q.channel)) {
+                        if list.iter().any(|e| e.handler.is_dyn()) {
+                            prebuilt = self.build_pooled_dyn(value);
+                        }
+                    }
+                    let mut view = self.make_typed_view(*id, q.channel, value);
+                    view.dyn_form = prebuilt.as_ref();
+                    view
+                }
+                OwnedPayload::Dyn(d) => EventView::dynamic(q.channel, d),
+            };
+            self.run_dispatch(view);
+        } // the view (and its Arc clone) drop here
+        // Handlers are done; the pooled dynamic form's buffers go back.
+        self.harvest_prebuilt(&mut prebuilt);
+    }
+
+    fn make_typed_view<'a>(
+        &self,
+        id: u64,
+        channel: Channel,
+        value: &'a OwnedTyped,
+    ) -> EventView<'a> {
+        EventView::raw_typed(
+            id,
+            channel,
+            value.ptr(),
+            value.layout.size(),
+            value.layout.align(),
+            &value.to_dyn,
+        )
+    }
+
+    fn run_dispatch(&self, ev: EventView<'_>) {
+        if let Some(list) = self.snapshot((ev.id, ev.channel)) {
+            for e in list.iter() {
+                if e.alive.load(Ordering::Acquire) {
+                    e.handler.deliver(&ev);
+                }
+            }
+        }
+    }
+
+    /// Handlers are done; the pooled dynamic form's buffers go back.
+    fn harvest_prebuilt(&self, prebuilt: &mut Option<DynEvent>) {
+        if let Some(ev) = prebuilt.take() {
+            self.pools.write(|p| p.put_dyn_fields(ev.fields));
+        }
+    }
+
     pub(crate) fn enqueue(&self, q: Queued) {
-        self.queue.write(|queue| queue.push_back(q));
+        let shard = queue_shard(q.channel);
+        self.queue[shard].write(|shard| {
+            // Stamp while holding the shard lock: for channels mapped to the
+            // same shard, sequence order now matches FIFO insertion order.
+            let seq = self.next_seq.fetch_add(1, Ordering::Relaxed);
+            shard.0.push_back((seq, q));
+        });
     }
 
     pub(crate) fn queued_len(&self) -> usize {
-        self.queue.read(VecDeque::len)
+        self.queue
+            .iter()
+            .map(|shard| shard.read(|shard| shard.0.len()))
+            .sum()
     }
 
     pub(crate) fn max_rounds(&self) -> u32 {
@@ -701,6 +1177,16 @@ impl<H: ?Sized + Slot> Core<H> {
 
     pub(crate) fn set_max_rounds(&self, n: u32) {
         self.max_rounds.store(n.max(1), Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(crate) fn set_parallel_flush(&self, enabled: bool) {
+        self.parallel_flush.store(enabled, Ordering::Release);
+    }
+
+    #[cfg(feature = "parallel")]
+    pub(crate) fn parallel_flush_enabled(&self) -> bool {
+        self.parallel_flush.load(Ordering::Acquire)
     }
 
     pub(crate) fn flush(&self, max_rounds: u32) -> FlushReport {
@@ -735,25 +1221,91 @@ impl<H: ?Sized + Slot> Core<H> {
 
     fn drain(&self, max_rounds: u32, report: &mut FlushReport) {
         loop {
-            let batch = self.queue.write(|q| {
-                if q.is_empty() {
-                    None
-                } else if report.rounds >= max_rounds {
-                    report.hit_round_limit = true;
-                    None
-                } else {
-                    Some(std::mem::take(q))
+            // Anything queued next round: dispatch, then go again.
+            if self.queued_len() == 0 {
+                return;
+            }
+            if report.rounds >= max_rounds {
+                report.hit_round_limit = true;
+                return;
+            }
+            // One shard lock at a time; publishers to other shards (and to
+            // this one, on another thread) keep going while we collect.
+            let mut collected = false;
+            for shard in &self.queue {
+                let had_events = shard.write(|shard| !shard.0.is_empty());
+                if had_events {
+                    self.batch_scratch
+                        .write(|batch| shard.write(|shard| batch.extend(shard.0.drain(..))));
+                    collected = true;
                 }
+            }
+            if !collected {
+                return;
+            }
+            // Restore the publish order across shard batches by sequence
+            // stamp, then deliver. Events queued by handlers during these
+            // deliveries only go to the shards, never to the scratch: take
+            // the merged batch out, deliver it, and return the buffer after
+            // the round so its capacity carries over.
+            let mut merged = self.batch_scratch.write(|batch| {
+                batch.sort_unstable_by_key(|(seq, _)| *seq);
+                std::mem::take(batch)
             });
-            let Some(batch) = batch else { return };
             report.rounds += 1;
-            // Delivered after the queue lock is released; each event is
-            // dropped right after its delivery.
-            for ev in batch {
-                self.dispatch_owned(&ev);
+            for (_, event) in merged.drain(..) {
+                // Delivered now; its buffers go to the pools right after.
+                self.dispatch_owned(&event);
+                self.recycle_queued(event);
                 report.delivered += 1;
             }
+            self.batch_scratch.write(|batch| *batch = merged);
         }
+    }
+
+    // --- payload pools ---------------------------------------------------
+
+    /// A pooled buffer matching `layout`, or `None` (allocate fresh).
+    pub(crate) fn take_buffer(&self, layout: &Layout) -> Option<NonNull<u8>> {
+        self.pools.write(|p| p.take_buffer(layout))
+    }
+
+    /// Overrides for the pool caps (tests/tools); excess buffers are
+    /// dropped at the next harvest.
+    pub(crate) fn set_pool_caps(&self, buffers: usize, dyn_cap: usize) {
+        self.pools.write(|p| {
+            p.buffers_cap = buffers;
+            p.dyn_cap = dyn_cap;
+            while p.buffers_len > buffers {
+                let pooled = p
+                    .buffers
+                    .iter_mut()
+                    .find_map(|(key, stack)| stack.pop().map(|ptr| (*key, ptr)));
+                let Some((key, ptr)) = pooled else {
+                    p.buffers_len = 0;
+                    break;
+                };
+                p.buffers_len -= 1;
+                let layout = Layout::from_size_align(key.0, key.1).expect("pooled layout");
+                unsafe { std::alloc::dealloc(ptr.as_ptr(), layout) };
+                p.buffers.retain(|_, stack| !stack.is_empty());
+            }
+            p.fields.truncate(dyn_cap);
+            p.strings.truncate(dyn_cap);
+            p.bytes.truncate(dyn_cap);
+        });
+    }
+
+    /// (buffers in pool, fields vecs, strings, bytes) — diagnostics.
+    pub(crate) fn pool_sizes(&self) -> (usize, usize, usize, usize) {
+        self.pools.write(|p| {
+            (
+                p.buffers_len,
+                p.fields.len(),
+                p.strings.len(),
+                p.bytes.len(),
+            )
+        })
     }
 
     // --- registry --------------------------------------------------------
@@ -862,5 +1414,92 @@ impl<H: ?Sized + Slot> Core<H> {
             Some(d) => d.check(ev),
             None => Err(DynEventError::UnknownEvent(ev.id)),
         })
+    }
+}
+
+impl Core<dyn ErasedHandler + Send + Sync> {
+    /// Sync-bus entry point. Parallelism is opt-in and only compiled with the
+    /// `parallel` feature; all other cases preserve sequential flush behavior.
+    pub(crate) fn flush_sync(&self, max_rounds: u32) -> FlushReport {
+        #[cfg(feature = "parallel")]
+        if self.parallel_flush_enabled() {
+            return self.flush_parallel(max_rounds);
+        }
+        self.flush(max_rounds)
+    }
+
+    #[cfg(feature = "parallel")]
+    fn flush_parallel(&self, max_rounds: u32) -> FlushReport {
+        let mut report = FlushReport::default();
+        loop {
+            if self.flushing.swap(true, Ordering::AcqRel) {
+                report.already_flushing = report.rounds == 0;
+                break;
+            }
+            {
+                struct Reset<'a>(&'a AtomicBool);
+                impl Drop for Reset<'_> {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+                let _reset = Reset(&self.flushing);
+                self.drain_parallel(max_rounds, &mut report);
+            }
+            if report.hit_round_limit || self.queued_len() == 0 {
+                break;
+            }
+        }
+        report.remaining = self.queued_len();
+        report
+    }
+
+    #[cfg(feature = "parallel")]
+    fn drain_parallel(&self, max_rounds: u32, report: &mut FlushReport) {
+        use rayon::prelude::*;
+
+        loop {
+            if self.queued_len() == 0 {
+                return;
+            }
+            if report.rounds >= max_rounds {
+                report.hit_round_limit = true;
+                return;
+            }
+            let mut collected = false;
+            for shard in &self.queue {
+                let had_events = shard.write(|shard| !shard.0.is_empty());
+                if had_events {
+                    self.batch_scratch
+                        .write(|batch| shard.write(|shard| batch.extend(shard.0.drain(..))));
+                    collected = true;
+                }
+            }
+            if !collected {
+                return;
+            }
+            let mut merged = self.batch_scratch.write(|batch| {
+                batch.sort_unstable_by_key(|(seq, _)| *seq);
+                std::mem::take(batch)
+            });
+            report.rounds += 1;
+
+            // Grouping follows the merged sequence order, so each channel's
+            // FIFO remains intact while independent channels can run at once.
+            let mut by_channel: BTreeMap<Channel, Vec<Queued>> = BTreeMap::new();
+            for (_, event) in merged.drain(..) {
+                by_channel.entry(event.channel).or_default().push(event);
+            }
+            let groups: Vec<Vec<Queued>> = by_channel.into_values().collect();
+            let delivered: usize = groups.iter().map(Vec::len).sum();
+            groups.into_par_iter().for_each(|events| {
+                for event in events {
+                    self.dispatch_owned(&event);
+                    self.recycle_queued(event);
+                }
+            });
+            report.delivered += delivered;
+            self.batch_scratch.write(|batch| *batch = merged);
+        }
     }
 }
