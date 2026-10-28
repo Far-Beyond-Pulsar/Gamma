@@ -1029,7 +1029,6 @@ fn interleaved_publishes_across_channels_flush_in_publish_order() {
             SubscribeOptions::channel(channels[index]).priority(index as i32),
             move |h: &Hit| g.lock().unwrap().push(h.target),
         ));
-
     }
     // Many interleaved publishes: shard assignments differ; the delivered
     // order is the single publish order.
@@ -1079,10 +1078,7 @@ fn sharded_concurrent_publishes_deliver_everything_exactly_once() {
                 for i in 0..1000u32 {
                     // Each thread uses its own entity channel, so the four
                     // streams interleave through the shard set.
-                    bus.publish_deferred_to(
-                        Channel::Entity(offset),
-                        Ping(i),
-                    );
+                    bus.publish_deferred_to(Channel::Entity(offset), Ping(i));
                 }
             });
         }
@@ -1110,5 +1106,172 @@ fn single_threaded_multi_shard_round_limit_accounting() {
     let report = bus.flush();
     assert_eq!(report.delivered, 3, "global counts too: it is dispatched");
     assert_eq!(*seen.borrow(), vec![0, 2], "entity channel order kept");
-    assert_eq!((report.rounds, report.hit_round_limit, report.remaining), (1, false, 0));
+    assert_eq!(
+        (report.rounds, report.hit_round_limit, report.remaining),
+        (1, false, 0)
+    );
+}
+
+#[test]
+fn batch_subscriptions_preserve_priority_order_and_drop_together() {
+    let bus = SyncEventBus::new();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let batch_seen = Arc::clone(&seen);
+    let batch = bus.subscribe_batch::<Ping, _, _>(
+        SubscribeOptions::default().priority(5),
+        (0..3).map(move |index| {
+            let seen = Arc::clone(&batch_seen);
+            move |_: &Ping| seen.lock().unwrap().push(index)
+        }),
+    );
+    assert_eq!(batch.len(), 3);
+    assert!(!batch.is_empty());
+    assert!(batch.is_active());
+
+    let later_seen = Arc::clone(&seen);
+    let _later = bus.subscribe_with(SubscribeOptions::default().priority(5), move |_: &Ping| {
+        later_seen.lock().unwrap().push(3)
+    });
+    bus.publish(Ping(0));
+    assert_eq!(*seen.lock().unwrap(), vec![0, 1, 2, 3]);
+
+    drop(batch);
+    assert_eq!(
+        bus.subscriber_count(Ping::stable_type_id(), Channel::Global),
+        1
+    );
+    seen.lock().unwrap().clear();
+    bus.publish(Ping(0));
+    assert_eq!(*seen.lock().unwrap(), vec![3]);
+}
+
+#[test]
+fn batch_unsubscribe_and_detach_have_expected_lifetimes() {
+    let bus = SyncEventBus::new();
+    let count = Arc::new(AtomicUsize::new(0));
+    let batch_count = Arc::clone(&count);
+    let batch = bus.subscribe_batch::<Ping, _, _>(
+        SubscribeOptions::default(),
+        (0..2).map(move |_| {
+            let count = Arc::clone(&batch_count);
+            move |_: &Ping| {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+        }),
+    );
+    let tokens = batch.tokens().to_vec();
+    assert_eq!(bus.unsubscribe_many(&tokens), 2);
+    assert!(!batch.any_active());
+    drop(batch);
+    assert_eq!(bus.unsubscribe_many(&tokens), 0);
+
+    let detached_count = Arc::clone(&count);
+    let detached = bus.subscribe_batch::<Ping, _, _>(
+        SubscribeOptions::default(),
+        (0..2).map(move |_| {
+            let count = Arc::clone(&detached_count);
+            move |_: &Ping| {
+                count.fetch_add(1, Ordering::Relaxed);
+            }
+        }),
+    );
+    detached.detach();
+    bus.publish(Ping(0));
+    assert_eq!(count.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        bus.subscriber_count(Ping::stable_type_id(), Channel::Global),
+        2
+    );
+}
+
+#[test]
+fn dynamic_batch_subscriptions_receive_reflected_events() {
+    let bus = EventBus::new();
+    let seen = Rc::new(Cell::new(0));
+    let batch_seen = Rc::clone(&seen);
+    let batch = bus.subscribe_batch_dyn(
+        Hit::stable_type_id(),
+        SubscribeOptions::default(),
+        (0..2).map(move |_| {
+            let seen = Rc::clone(&batch_seen);
+            move |event: &DynEvent| seen.set(seen.get() + event.fields.len())
+        }),
+    );
+    assert_eq!(batch.len(), 2);
+    bus.publish(Hit {
+        target: 7,
+        damage: 3.0,
+        critical: true,
+    });
+    assert_eq!(seen.get(), 6);
+    drop(batch);
+    bus.publish(Hit {
+        target: 8,
+        damage: 2.0,
+        critical: false,
+    });
+    assert_eq!(seen.get(), 6);
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn parallel_deferred_flush_preserves_fifo_per_channel() {
+    let bus = SyncEventBus::new();
+    assert!(!bus.parallel_flush_enabled());
+    let channels = [Channel::Entity(11), Channel::Entity(22), Channel::Class(33)];
+    let logs: Vec<_> = channels
+        .iter()
+        .map(|_| Arc::new(Mutex::new(Vec::new())))
+        .collect();
+    let mut subscriptions = Vec::new();
+    for (channel, log) in channels.iter().copied().zip(logs.iter().cloned()) {
+        subscriptions.push(
+            bus.subscribe_with(SubscribeOptions::channel(channel), move |p: &Ping| {
+                log.lock().unwrap().push(p.0)
+            }),
+        );
+    }
+    bus.set_parallel_flush(true);
+    assert!(bus.parallel_flush_enabled());
+
+    const COUNT: u32 = 256;
+    for i in 0..COUNT {
+        for channel in channels {
+            bus.publish_deferred_to(channel, Ping(i));
+        }
+    }
+    let report = bus.flush();
+    assert_eq!(report.delivered, COUNT as usize * channels.len());
+    for log in logs {
+        assert_eq!(*log.lock().unwrap(), (0..COUNT).collect::<Vec<_>>());
+    }
+}
+
+#[cfg(feature = "parallel")]
+#[test]
+fn parallel_flush_keeps_reentrancy_on_the_next_round() {
+    let bus = SyncEventBus::new();
+    bus.set_parallel_flush(true);
+    let nested = Arc::new(Mutex::new(Vec::new()));
+    let nested_report = Arc::clone(&nested);
+    let nested_bus = bus.clone();
+    let delivered = Arc::new(AtomicUsize::new(0));
+    let delivered_count = Arc::clone(&delivered);
+    let _sub = bus.subscribe(move |p: &Ping| {
+        delivered_count.fetch_add(1, Ordering::Relaxed);
+        if p.0 == 0 {
+            nested_bus.publish_deferred(Ping(1));
+            nested_report.lock().unwrap().push(nested_bus.flush());
+        }
+    });
+
+    bus.publish_deferred(Ping(0));
+    let report = bus.flush();
+    assert_eq!(report.rounds, 2);
+    assert_eq!(report.delivered, 2);
+    assert_eq!(delivered.load(Ordering::Relaxed), 2);
+    let nested = nested.lock().unwrap();
+    assert_eq!(nested.len(), 1);
+    assert!(nested[0].already_flushing);
+    assert_eq!(nested[0].delivered, 0);
 }

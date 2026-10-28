@@ -87,8 +87,8 @@ pub mod ffi;
 pub mod stable_id;
 
 pub use bus::{
-    EventBus, SubscribeOptions, Subscription, SyncEventBus, SyncSubscription, WeakEventBus,
-    WeakSyncEventBus,
+    EventBus, SubscribeOptions, Subscription, SubscriptionBatch, SyncEventBus, SyncSubscription,
+    SyncSubscriptionBatch, WeakEventBus, WeakSyncEventBus,
 };
 pub use channel::Channel;
 pub use core::FlushReport;
@@ -170,7 +170,5 @@ pub trait Event: 'static {
 
 #[doc(hidden)]
 pub mod __private {
-    pub use crate::stable_id::{
-        type_id, type_id_in, type_id_with_fields, type_id_with_fields_in,
-    };
+    pub use crate::stable_id::{type_id, type_id_in, type_id_with_fields, type_id_with_fields_in};
 }

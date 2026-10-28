@@ -114,6 +114,36 @@ fn bench_subscribe(c: &mut Criterion) {
     });
 }
 
+fn bench_subscription_batches(c: &mut Criterion) {
+    let mut group = c.benchmark_group("subscription lifecycle: individual vs batch");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_secs(1));
+    group.measurement_time(std::time::Duration::from_secs(3));
+    for count in [100usize, 500, 2_000] {
+        group.throughput(criterion::Throughput::Elements(count as u64));
+        let bus = EventBus::new();
+        group.bench_function(format!("individual/{count}"), |b| {
+            b.iter(|| {
+                let mut subscriptions = Vec::with_capacity(count);
+                for _ in 0..count {
+                    subscriptions.push(bus.subscribe(|_: &EmptyEvent| black_box(())));
+                }
+                drop(subscriptions);
+            })
+        });
+        group.bench_function(format!("batch/{count}"), |b| {
+            b.iter(|| {
+                let batch = bus.subscribe_batch::<EmptyEvent, _, _>(
+                    SubscribeOptions::default(),
+                    (0..count).map(|_| |_: &EmptyEvent| black_box(())),
+                );
+                drop(batch);
+            })
+        });
+    }
+    group.finish();
+}
+
 // ---------------------------------------------------------------------------
 // Deferred delivery
 // ---------------------------------------------------------------------------
@@ -362,12 +392,60 @@ fn bench_parallel_overhead(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_parallel_deferred_flush(c: &mut Criterion) {
+    #[cfg(feature = "parallel")]
+    {
+        const CHANNELS: usize = 8;
+        const EVENTS_PER_CHANNEL: usize = 64;
+        const WORK: u64 = 10_000;
+        let make_bus = |parallel: bool| {
+            let bus = SyncEventBus::new();
+            for channel in 0..CHANNELS {
+                bus.subscribe_with(
+                    SubscribeOptions::channel(Channel::Entity(channel as u64)),
+                    move |_: &EmptyEvent| {
+                        black_box(busy(WORK, channel as u64));
+                    },
+                )
+                .detach();
+            }
+            bus.set_parallel_flush(parallel);
+            bus
+        };
+        let seq = make_bus(false);
+        let par = make_bus(true);
+        let mut group = c.benchmark_group("deferred flush across independent channels");
+        group.sample_size(10);
+        group.warm_up_time(std::time::Duration::from_secs(1));
+        group.measurement_time(std::time::Duration::from_secs(3));
+        group.throughput(criterion::Throughput::Elements(
+            (CHANNELS * EVENTS_PER_CHANNEL) as u64,
+        ));
+        for (label, bus) in [("sequential", seq), ("parallel", par)] {
+            group.bench_function(label, |b| {
+                b.iter(|| {
+                    for _ in 0..EVENTS_PER_CHANNEL {
+                        for channel in 0..CHANNELS {
+                            bus.publish_deferred_to(Channel::Entity(channel as u64), EmptyEvent);
+                        }
+                    }
+                    black_box(bus.flush())
+                })
+            });
+        }
+        group.finish();
+    }
+    #[cfg(not(feature = "parallel"))]
+    let _ = c;
+}
+
 criterion_group!(
     benches,
     bench_publish_n_subs,
     bench_publish_large,
     bench_publish_entity_channel,
     bench_subscribe,
+    bench_subscription_batches,
     bench_deferred_flush,
     bench_dynamic,
     bench_sync_bus_publish,
@@ -376,6 +454,7 @@ criterion_group!(
     bench_flush_only,
     bench_parallel_vs_seq,
     bench_parallel_overhead,
+    bench_parallel_deferred_flush,
 );
 
 criterion_main!(benches);

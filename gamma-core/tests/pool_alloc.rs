@@ -20,6 +20,15 @@ struct Hit {
     flags: Vec<u8>,
 }
 
+#[pulsar_event(dynamic)]
+struct SmallHit {
+    entity: u64,
+    value: f64,
+}
+
+#[pulsar_event]
+struct Medium([u8; 64]);
+
 // ---------------------------------------------------------------------------
 // Counting allocator
 // ---------------------------------------------------------------------------
@@ -81,9 +90,8 @@ fn armed(on: bool) {
 // Typed payload pool
 // ---------------------------------------------------------------------------
 
-/// Publishing and flushing the same small event is allocation-free in
-/// steady state: the queue deque grew during warm-up, the payload buffer is
-/// pooled, and the merge buffer keeps its capacity.
+/// Publishing and flushing the same small event is allocation-free after
+/// queue and merge capacities are primed. The payload is stored inline.
 #[test]
 fn pooled_typed_round_trip_is_zero_alloc() {
     let _g = TEST_LOCK.lock().unwrap();
@@ -95,21 +103,19 @@ fn pooled_typed_round_trip_is_zero_alloc() {
         hitc.fetch_add(1, Ordering::Relaxed);
     });
     const N: usize = 10_000;
-    // Cold pass: one buffer alloc, deque growth, merge buffer growth.
+    // Prime the shard deque and the merge scratch capacity.
     for i in 0..N as u32 {
         bus.publish_deferred(Ping(i));
     }
     let report = bus.flush();
     assert_eq!(report.delivered, N);
 
-    // Warm pass. Publish is structural: each queued event holds a live
-    // payload buffer until delivery, so a pool can only cover the flush
-    // phase (buffers recycle delivery by delivery, not at queue time).
+    // Measure the complete producer-to-consumer path, not only flush.
+    reset_counts();
+    armed(true);
     for i in 0..N as u32 {
         bus.publish_deferred(Ping(i));
     }
-    armed(true);
-    reset_counts();
     bus.flush();
     assert_eq!(hit.load(Ordering::Relaxed), 2 * N);
     assert_eq!(
@@ -126,9 +132,8 @@ fn pooled_typed_round_trip_is_zero_alloc() {
 
 /// A dynamic subscriber sees the pooled dynamic form: publishing many
 /// events first, then flushing, delivers all of them from pooled buffers.
-/// The only allocation inside the warm flush is one shared `Arc` handle
-/// per event (the single conversion's owner), so conversions, strings,
-/// byte vectors, fields vectors, and payload buffers all recycle.
+/// Conversion buffers and the event view are reused; callers' owned String
+/// and Vec fields are constructed before measurement and are outside Gamma.
 #[test]
 fn pooled_dyn_conversion_is_zero_alloc_in_steady_flush() {
     let _g = TEST_LOCK.lock().unwrap();
@@ -169,9 +174,66 @@ fn pooled_dyn_conversion_is_zero_alloc_in_steady_flush() {
     bus.flush();
     assert_eq!(
         allocated(),
-        N,
+        0,
         "steady-state flush with dynamic conversions allocated"
     );
     assert_eq!(hits.load(Ordering::Relaxed), 2 * N);
     armed(false);
+}
+
+#[test]
+fn small_typed_to_dynamic_publish_and_flush_is_zero_alloc() {
+    let _g = TEST_LOCK.lock().unwrap();
+    let bus = SyncEventBus::new();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let handler_hits = Arc::clone(&hits);
+    let _sub = bus.subscribe_dyn(
+        SmallHit::stable_type_id(),
+        gamma_core::SubscribeOptions::default(),
+        move |event: &DynEvent| {
+            handler_hits.fetch_add(event.fields.len(), Ordering::Relaxed);
+        },
+    );
+    const N: usize = 10_000;
+    let publish_burst = |bus: &SyncEventBus| {
+        for i in 0..N {
+            bus.publish_deferred(SmallHit {
+                entity: i as u64,
+                value: i as f64,
+            });
+        }
+    };
+
+    publish_burst(&bus);
+    assert_eq!(bus.flush().delivered, N);
+    reset_counts();
+    armed(true);
+    publish_burst(&bus);
+    assert_eq!(bus.flush().delivered, N);
+    assert_eq!(hits.load(Ordering::Relaxed), N * 4);
+    assert_eq!(
+        allocated(),
+        0,
+        "warm typed-to-dynamic publish and flush should allocate nothing"
+    );
+    armed(false);
+}
+
+#[test]
+fn reducing_the_payload_pool_cap_releases_excess_buffers() {
+    let bus = SyncEventBus::new();
+    bus.subscribe(|event: &Medium| {
+        std::hint::black_box(event.0[0]);
+    })
+    .detach();
+    bus.set_pool_caps(1, 1);
+    bus.publish_deferred(Medium([7; 64]));
+    assert_eq!(bus.flush().delivered, 1);
+    assert_eq!(bus.pool_sizes().0, 1);
+
+    bus.set_pool_caps(0, 0);
+    assert_eq!(bus.pool_sizes().0, 0);
+    bus.publish_deferred(Medium([9; 64]));
+    assert_eq!(bus.flush().delivered, 1);
+    assert_eq!(bus.pool_sizes().0, 0);
 }

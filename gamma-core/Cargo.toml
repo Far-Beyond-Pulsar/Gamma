@@ -23,3 +23,7 @@ libloading = "0.8"
 [[bench]]
 name = "throughput"
 harness = false
+
+[[bench]]
+name = "queue_pipeline"
+harness = false

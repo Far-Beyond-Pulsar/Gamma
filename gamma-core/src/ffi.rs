@@ -44,11 +44,11 @@
 //! plugin cannot know which bus it was given. A panic that reaches an
 //! `extern "C"` function aborts the process.
 
+use std::alloc::Layout;
 use std::ffi::c_void;
 use std::fmt;
 use std::mem::ManuallyDrop;
 use std::sync::{Arc, Weak};
-use std::alloc::Layout;
 
 use crate::core::{
     Core, ErasedHandler, EventView, OwnedPayload, OwnedTyped, Payload, Queued, Slot, ToDyn,
@@ -466,14 +466,18 @@ unsafe extern "C" fn host_publish_deferred<H: ?Sized + Slot>(
             },
         )) => {
             let layout = Layout::from_size_align(size, align).ok();
-            let buffer = layout
-                .as_ref()
-                .and_then(|l| core.take_buffer(l));
+            let buffer = layout.as_ref().and_then(|l| {
+                if OwnedTyped::can_inline(l) {
+                    None
+                } else {
+                    core.take_buffer(l)
+                }
+            });
             match unsafe { OwnedTyped::from_foreign(ptr, size, align, drop_fn, to_dyn, buffer) } {
                 Some(value) => (channel, OwnedPayload::Typed { id: ev.id, value }),
                 None => return STATUS_BAD_LAYOUT,
             }
-        },
+        }
         Ok((channel, Incoming::Dyn(d))) => (channel, OwnedPayload::Dyn(d)),
         Err(status) => return status,
     };

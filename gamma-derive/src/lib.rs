@@ -52,7 +52,9 @@ impl Options {
                 v.parse()?
             });
         } else {
-            return Err(meta.error("expected `dynamic`, `name = \"...\"`, `namespace = \"...\"` or `crate = path`"));
+            return Err(meta.error(
+                "expected `dynamic`, `name = \"...\"`, `namespace = \"...\"` or `crate = path`",
+            ));
         }
         Ok(())
     }

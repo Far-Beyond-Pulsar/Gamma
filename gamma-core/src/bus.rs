@@ -47,7 +47,7 @@ type SyncCore = Core<dyn ErasedHandler + Send + Sync>;
 // The two buses share every method except for the `Send + Sync` bounds on
 // handlers and events; this macro writes the common part once.
 macro_rules! common_api {
-    ($Sub:ident, $($handler_bounds:tt)*) => {
+    ($Sub:ident, $SubB:ident, $Handler:ty, $flush_method:ident; $($handler_bounds:tt)*) => {
         /// Subscribe to `T` on the global channel with priority 0.
         ///
         /// The handler stays registered until the returned handle is dropped,
@@ -83,6 +83,76 @@ macro_rules! common_api {
             let token = self.core.next_token();
             self.core.insert(id, opts.channel, entry(token, opts.priority, DynHandler(handler)));
             $Sub { core: Some(Arc::downgrade(&self.core)), token }
+        }
+
+        /// Subscribe many handlers to `T` in one lock round: one write lock,
+        /// one CoW clone, one sorted insert per handler.
+        ///
+        /// For spawn/despawn storms where a loop installs one (event,
+        /// channel) subscription per instance, this pays the table write and
+        /// copy-on-write clone once for the batch instead of per entry. The
+        /// batch's handlers keep their order after higher- and equal-priority
+        /// entries.
+        pub fn subscribe_batch<T: Event, F, I>(
+            &self,
+            opts: SubscribeOptions,
+            handlers: I,
+        ) -> $SubB
+        where
+            F: Fn(&T) + $($handler_bounds)*,
+            I: IntoIterator<Item = F>,
+        {
+            let id = T::stable_type_id();
+            let channel = opts.channel;
+            let priority = opts.priority;
+            let mut tokens = Vec::new();
+            let entries = handlers
+                .into_iter()
+                .map(|handler| {
+                    let token = self.core.next_token();
+                    tokens.push(token);
+                    let entry: Arc<crate::core::Entry<$Handler>> =
+                        entry(token, priority, TypedHandler::<T, F>::new(handler));
+                    (id, channel, entry)
+                })
+                .collect();
+            self.core.insert_many(entries);
+            $SubB { core: Some(Arc::downgrade(&self.core)), tokens }
+        }
+
+        /// Subscribe many dynamic handlers to event `id` in one lock round;
+        /// see [`subscribe_batch`](Self::subscribe_batch).
+        pub fn subscribe_batch_dyn<F, I>(
+            &self,
+            id: u64,
+            opts: SubscribeOptions,
+            handlers: I,
+        ) -> $SubB
+        where
+            F: Fn(&DynEvent) + $($handler_bounds)*,
+            I: IntoIterator<Item = F>,
+        {
+            let channel = opts.channel;
+            let priority = opts.priority;
+            let mut tokens = Vec::new();
+            let entries = handlers
+                .into_iter()
+                .map(|handler| {
+                    let token = self.core.next_token();
+                    tokens.push(token);
+                    let entry: Arc<crate::core::Entry<$Handler>> =
+                        entry(token, priority, DynHandler(handler));
+                    (id, channel, entry)
+                })
+                .collect();
+            self.core.insert_many(entries);
+            $SubB { core: Some(Arc::downgrade(&self.core)), tokens }
+        }
+
+        /// Unsubscribe a list of tokens in one write lock round. Returns how
+        /// many were still subscribed; unknown tokens are ignored.
+        pub fn unsubscribe_many(&self, tokens: &[u64]) -> usize {
+            self.core.remove_many(tokens)
         }
 
         /// Deliver `event` on the global channel now.
@@ -126,12 +196,12 @@ macro_rules! common_api {
         /// queued and [`FlushReport::hit_round_limit`] is set. Subscribers
         /// are resolved at delivery time, not at publish time.
         pub fn flush(&self) -> FlushReport {
-            self.core.flush(self.core.max_rounds())
+            self.core.$flush_method(self.core.max_rounds())
         }
 
         /// [`flush`](Self::flush) with an explicit round limit (at least 1).
         pub fn flush_with_limit(&self, max_rounds: u32) -> FlushReport {
-            self.core.flush(max_rounds.max(1))
+            self.core.$flush_method(max_rounds.max(1))
         }
 
         /// Set the default flush round limit (at least 1; default
@@ -280,6 +350,82 @@ macro_rules! subscription {
     };
 }
 
+macro_rules! subscription_batch {
+    ($(#[$m:meta])* $Sub:ident, $CoreTy:ty) => {
+        $(#[$m])*
+        #[must_use = "dropping a subscription batch unsubscribes all of its handlers; call .detach() to keep them for the bus's lifetime"]
+        pub struct $Sub {
+            core: Option<Weak<$CoreTy>>,
+            tokens: Vec<u64>,
+        }
+
+        impl $Sub {
+            /// Remove every handler of the batch now. Safe to call from
+            /// inside a handler (including one of the batch's own): the
+            /// running handler is skipped for the rest of the dispatch and
+            /// dropped when that dispatch ends.
+            pub fn unsubscribe(mut self) {
+                self.remove();
+            }
+
+            /// Keep the handlers registered until the bus is dropped (or
+            /// their channel is cleared), and discard the handle.
+            pub fn detach(mut self) {
+                self.core = None;
+            }
+
+            /// `true` while every handler of the batch is registered.
+            pub fn is_active(&self) -> bool {
+                self.core
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|c| self.tokens.iter().all(|t| c.is_subscribed(*t)))
+            }
+
+            /// `true` while at least one handler of the batch is registered.
+            pub fn any_active(&self) -> bool {
+                self.core
+                    .as_ref()
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|c| self.tokens.iter().any(|t| c.is_subscribed(*t)))
+            }
+
+            /// The batch's subscription tokens, in batch order.
+            pub fn tokens(&self) -> &[u64] {
+                &self.tokens
+            }
+
+            /// Number of handlers in the batch.
+            pub fn len(&self) -> usize {
+                self.tokens.len()
+            }
+
+            /// Whether the batch is empty.
+            pub fn is_empty(&self) -> bool {
+                self.tokens.is_empty()
+            }
+
+            fn remove(&mut self) {
+                if let Some(core) = self.core.take().and_then(|w| w.upgrade()) {
+                    core.remove_many(&self.tokens);
+                }
+            }
+        }
+
+        impl Drop for $Sub {
+            fn drop(&mut self) {
+                self.remove();
+            }
+        }
+
+        impl std::fmt::Debug for $Sub {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct(stringify!($Sub)).field("tokens", &self.tokens).finish()
+            }
+        }
+    };
+}
+
 // ---------------------------------------------------------------------------
 // EventBus
 // ---------------------------------------------------------------------------
@@ -310,6 +456,13 @@ subscription!(
     LocalCore
 );
 
+subscription_batch!(
+    /// Handle for a batch of [`EventBus`] subscriptions. Unsubscribes all of
+    /// them on drop.
+    SubscriptionBatch,
+    LocalCore
+);
+
 impl EventBus {
     /// An empty bus.
     pub fn new() -> Self {
@@ -327,7 +480,13 @@ impl EventBus {
         WeakEventBus(Arc::downgrade(&self.core))
     }
 
-    common_api!(Subscription, 'static);
+    common_api!(
+        Subscription,
+        SubscriptionBatch,
+        dyn ErasedHandler,
+        flush;
+        'static
+    );
 
     /// Bound the payload pools: at most `buffers_cap` recycled typed
     /// buffers and `dyn_cap` recycled field buffers are kept; anything
@@ -343,7 +502,12 @@ impl EventBus {
 
     /// Queue `event` on `channel` for the next [`flush`](Self::flush).
     pub fn publish_deferred_to<T: Event>(&self, channel: Channel, event: T) {
-        let buffer = self.core.take_buffer(&Layout::new::<T>());
+        let layout = Layout::new::<T>();
+        let buffer = if OwnedTyped::can_inline(&layout) {
+            None
+        } else {
+            self.core.take_buffer(&layout)
+        };
         // SAFETY: the pooled buffer (if any) is a live allocation of T's
         // layout with its contents already dropped.
         let value = unsafe { OwnedTyped::with_buffer(event, buffer) };
@@ -403,6 +567,13 @@ subscription!(
     SyncCore
 );
 
+subscription_batch!(
+    /// Handle for a batch of [`SyncEventBus`] subscriptions. Unsubscribes all
+    /// of them on drop.
+    SyncSubscriptionBatch,
+    SyncCore
+);
+
 impl SyncEventBus {
     /// An empty bus.
     pub fn new() -> Self {
@@ -416,7 +587,27 @@ impl SyncEventBus {
         WeakSyncEventBus(Arc::downgrade(&self.core))
     }
 
-    common_api!(SyncSubscription, Send + Sync + 'static);
+    common_api!(
+        SyncSubscription,
+        SyncSubscriptionBatch,
+        dyn ErasedHandler + Send + Sync,
+        flush_sync;
+        Send + Sync + 'static
+    );
+
+    /// Enable opt-in parallel deferred delivery across independent channels.
+    /// Events on the same channel remain FIFO. Available with the `parallel`
+    /// feature; sequential flush remains the default.
+    #[cfg(feature = "parallel")]
+    pub fn set_parallel_flush(&self, enabled: bool) {
+        self.core.set_parallel_flush(enabled);
+    }
+
+    /// Whether parallel deferred delivery is enabled.
+    #[cfg(feature = "parallel")]
+    pub fn parallel_flush_enabled(&self) -> bool {
+        self.core.parallel_flush_enabled()
+    }
 
     /// Bound the payload pools: at most `buffers_cap` recycled typed
     /// buffers and `dyn_cap` recycled field buffers are kept; anything
@@ -437,7 +628,12 @@ impl SyncEventBus {
 
     /// Queue `event` on `channel` for the next [`flush`](Self::flush).
     pub fn publish_deferred_to<T: Event + Send>(&self, channel: Channel, event: T) {
-        let buffer = self.core.take_buffer(&Layout::new::<T>());
+        let layout = Layout::new::<T>();
+        let buffer = if OwnedTyped::can_inline(&layout) {
+            None
+        } else {
+            self.core.take_buffer(&layout)
+        };
         // SAFETY: the pooled buffer (if any) is a live allocation of T's
         // layout with its contents already dropped.
         let value = unsafe { OwnedTyped::with_buffer(event, buffer) };
