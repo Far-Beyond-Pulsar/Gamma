@@ -1,5 +1,6 @@
 //! [`EventBus`], [`SyncEventBus`] and their subscription handles.
 
+use std::alloc::Layout;
 use std::sync::{Arc, Weak};
 
 use crate::core::{
@@ -328,6 +329,13 @@ impl EventBus {
 
     common_api!(Subscription, 'static);
 
+    /// Bound the payload pools: at most `buffers_cap` recycled typed
+    /// buffers and `dyn_cap` recycled field buffers are kept; anything
+    /// delivered past that is freed normally.
+    pub fn set_pool_caps(&self, buffers_cap: usize, dyn_cap: usize) {
+        self.core.set_pool_caps(buffers_cap, dyn_cap);
+    }
+
     /// Queue `event` on the global channel for the next [`flush`](Self::flush).
     pub fn publish_deferred<T: Event>(&self, event: T) {
         self.publish_deferred_to(Channel::Global, event)
@@ -335,11 +343,15 @@ impl EventBus {
 
     /// Queue `event` on `channel` for the next [`flush`](Self::flush).
     pub fn publish_deferred_to<T: Event>(&self, channel: Channel, event: T) {
+        let buffer = self.core.take_buffer(&Layout::new::<T>());
+        // SAFETY: the pooled buffer (if any) is a live allocation of T's
+        // layout with its contents already dropped.
+        let value = unsafe { OwnedTyped::with_buffer(event, buffer) };
         self.core.enqueue(Queued {
             channel,
             payload: OwnedPayload::Typed {
                 id: T::stable_type_id(),
-                value: OwnedTyped::new(event),
+                value,
             },
         });
     }
@@ -406,6 +418,18 @@ impl SyncEventBus {
 
     common_api!(SyncSubscription, Send + Sync + 'static);
 
+    /// Bound the payload pools: at most `buffers_cap` recycled typed
+    /// buffers and `dyn_cap` recycled field buffers are kept; anything
+    /// delivered past that is freed normally.
+    pub fn set_pool_caps(&self, buffers_cap: usize, dyn_cap: usize) {
+        self.core.set_pool_caps(buffers_cap, dyn_cap);
+    }
+
+    /// (buffers in pool, fields vecs, strings, bytes) — diagnostics.
+    pub fn pool_sizes(&self) -> (usize, usize, usize, usize) {
+        self.core.pool_sizes()
+    }
+
     /// Queue `event` on the global channel for the next [`flush`](Self::flush).
     pub fn publish_deferred<T: Event + Send>(&self, event: T) {
         self.publish_deferred_to(Channel::Global, event)
@@ -413,11 +437,15 @@ impl SyncEventBus {
 
     /// Queue `event` on `channel` for the next [`flush`](Self::flush).
     pub fn publish_deferred_to<T: Event + Send>(&self, channel: Channel, event: T) {
+        let buffer = self.core.take_buffer(&Layout::new::<T>());
+        // SAFETY: the pooled buffer (if any) is a live allocation of T's
+        // layout with its contents already dropped.
+        let value = unsafe { OwnedTyped::with_buffer(event, buffer) };
         self.core.enqueue(Queued {
             channel,
             payload: OwnedPayload::Typed {
                 id: T::stable_type_id(),
-                value: OwnedTyped::new(event),
+                value,
             },
         });
     }

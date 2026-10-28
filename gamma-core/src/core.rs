@@ -29,7 +29,15 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use rustc_hash::FxHashMap;
 
 use crate::ffi::{ForeignHandler, RawDropFn, RawSink, RawToDynFn};
-use crate::{Channel, DynEvent, DynEventError, Event, EventDescriptor, RegistryError};
+use crate::dynamic::SinkSpares;
+use crate::{
+    Channel, DynEvent, DynEventError, DynEventSink, DynValue, Event, EventDescriptor, RegistryError,
+};
+
+/// Pool cap defaults: 64 recycled typed buffers, 256 dynamic field buffers
+/// per shape (`Pools::buffers_cap` / `dyn_cap`).
+pub(crate) const DEFAULT_POOL_BUFFERS_CAP: usize = 64;
+pub(crate) const DEFAULT_POOL_DYN_CAP: usize = 256;
 
 pub(crate) type Key = (u64, Channel);
 
@@ -108,8 +116,9 @@ impl<E: Clone> SharedList<E> for Arc<Vec<E>> {
 /// How to turn a typed payload into a [`DynEvent`].
 pub(crate) enum ToDyn {
     None,
-    /// `T::to_dyn` from this copy of gamma-core.
-    Local(unsafe fn(*const u8) -> Option<DynEvent>),
+    /// Writes this copy of gamma-core's event into a [`DynEventSink`] via
+    /// `Event::to_dyn_into` (equivalent to `T::to_dyn`, pooled-capable).
+    Local(unsafe fn(*const u8, &mut DynEventSink) -> bool),
     /// A plugin's encoder (writes the wire format into a sink).
     Foreign(RawToDynFn),
 }
@@ -123,13 +132,25 @@ impl ToDyn {
         }
     }
 
+    /// The dynamic form with fresh buffers (no pool in reach).
+    ///
     /// # Safety
     /// `ptr` must point to a live value of the type this converter was made for.
-    unsafe fn convert(&self, ptr: *const u8) -> Option<DynEvent> {
+    pub(crate) fn convert(&self, ptr: *const u8) -> Option<DynEvent> {
         match self {
             ToDyn::None => None,
             // SAFETY: forwarded from the caller.
-            ToDyn::Local(f) => unsafe { f(ptr) },
+            ToDyn::Local(f) => unsafe {
+                let mut sink = DynEventSink::empty();
+                let ok = f(ptr, &mut sink);
+                let (event, spares) = sink.finish();
+                drop(spares);
+                if ok {
+                    event
+                } else {
+                    None
+                }
+            },
             ToDyn::Foreign(f) => {
                 let mut buf: Vec<u8> = Vec::new();
                 let mut sink = RawSink {
@@ -144,9 +165,9 @@ impl ToDyn {
     }
 }
 
-unsafe fn to_dyn_thunk<T: Event>(ptr: *const u8) -> Option<DynEvent> {
+unsafe fn to_dyn_thunk<T: Event>(ptr: *const u8, sink: &mut DynEventSink) -> bool {
     // SAFETY: only built by `ToDyn::of::<T>` and called with a `*const T`.
-    unsafe { &*ptr.cast::<T>() }.to_dyn()
+    unsafe { &*ptr.cast::<T>() }.to_dyn_into(sink)
 }
 
 /// The sink a plugin's `to_dyn` writes into. The bytes are copied into a
@@ -181,6 +202,10 @@ pub(crate) struct EventView<'a> {
     pub channel: Channel,
     pub payload: Payload<'a>,
     dyn_cache: OnceLock<Option<DynEvent>>,
+    /// The pooled dynamic form, built by the flush before dispatch (see
+    /// `build_pooled_dyn`). Shared so the flush can recycle its buffers
+    /// after delivery; it takes precedence over `dyn_cache`.
+    pub(crate) dyn_form: OnceLock<Arc<DynEvent>>,
     enc_cache: OnceLock<Option<Vec<u8>>>,
 }
 
@@ -219,6 +244,7 @@ impl<'a> EventView<'a> {
                 to_dyn,
             },
             dyn_cache: OnceLock::new(),
+            dyn_form: OnceLock::new(),
             enc_cache: OnceLock::new(),
         }
     }
@@ -229,18 +255,25 @@ impl<'a> EventView<'a> {
             channel,
             payload: Payload::Dyn(ev),
             dyn_cache: OnceLock::new(),
+            dyn_form: OnceLock::new(),
             enc_cache: OnceLock::new(),
         }
     }
 
     /// The event as a [`DynEvent`], if it is dynamic or its type is reflected.
     pub(crate) fn as_dyn(&self) -> Option<&DynEvent> {
+        // The flush built the pooled form; deliver that.
+        if let Payload::Typed { .. } = &self.payload {
+            if let Some(f) = self.dyn_form.get() {
+                return Some(f);
+            }
+        }
         match &self.payload {
             Payload::Dyn(d) => Some(d),
             // SAFETY: `ptr` is the live value this view was built from.
             Payload::Typed { ptr, to_dyn, .. } => self
                 .dyn_cache
-                .get_or_init(|| unsafe { to_dyn.convert(*ptr) })
+                .get_or_init(|| to_dyn.convert(*ptr))
                 .as_ref(),
         }
     }
@@ -261,6 +294,11 @@ impl<'a> EventView<'a> {
 /// created them (see `ForeignHandler` for plugin subscribers).
 pub(crate) trait ErasedHandler {
     fn deliver(&self, ev: &EventView<'_>);
+    /// `true` when this handler invokes its callback with the *dynamic*
+    /// form (so the flush can build it from pooled buffers up front).
+    fn is_dyn(&self) -> bool {
+        false
+    }
 }
 
 /// The handler object type stored by one bus flavour, and the
@@ -361,6 +399,10 @@ impl<F: Fn(&DynEvent)> ErasedHandler for DynHandler<F> {
             (self.0)(d);
         }
     }
+
+    fn is_dyn(&self) -> bool {
+        true
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -388,7 +430,7 @@ pub(crate) struct OwnedTyped {
 unsafe impl Send for OwnedTyped {}
 
 unsafe fn drop_thunk<T>(p: *mut u8) {
-    // SAFETY: called once on the buffer `OwnedTyped::new::<T>` wrote.
+    // SAFETY: called once on the buffer the pooled constructor wrote.
     unsafe { std::ptr::drop_in_place(p.cast::<T>()) }
 }
 
@@ -404,10 +446,19 @@ impl OwnedTyped {
         NonNull::new(p).unwrap_or_else(|| std::alloc::handle_alloc_error(layout))
     }
 
-    pub(crate) fn new<T: Event>(value: T) -> Self {
+    /// Take the value with a pooled buffer instead of a fresh allocation.
+    ///
+    /// # Safety
+    /// `buffer` must be a live allocation of exactly `T`'s layout whose
+    /// contents were already dropped, or `None`.
+    pub(crate) unsafe fn with_buffer<T: Event>(value: T, buffer: Option<NonNull<u8>>) -> Self {
         let layout = Layout::new::<T>();
-        let ptr = Self::alloc(layout);
-        // SAFETY: freshly allocated for `T`'s layout.
+        let ptr = match buffer {
+            Some(p) if layout.size() != 0 => p,
+            _ => Self::alloc(layout),
+        };
+        // SAFETY: the buffer holds `T`'s layout (contents already dropped, so
+        // writing over them is a plain memory write, not a double drop).
         unsafe { ptr.as_ptr().cast::<T>().write(value) };
         Self {
             ptr,
@@ -421,21 +472,45 @@ impl OwnedTyped {
         }
     }
 
+    /// Drop the value, keep the buffer for the pool.
+    ///
+    /// # Safety
+    /// The buffer must not be used again until it is pooled or freed; this
+    /// consumes the event (its drop fn runs exactly once here).
+    unsafe fn drop_contents_keep_buffer(self) -> (NonNull<u8>, Layout) {
+        let this = std::mem::ManuallyDrop::new(self);
+        // SAFETY: runs once for the live value in the buffer.
+        unsafe {
+            match this.drop_fn {
+                DropFn::None => {}
+                DropFn::Local(f) => f(this.ptr.as_ptr()),
+                DropFn::Foreign(f) => f(this.ptr.as_ptr()),
+            }
+        }
+        (this.ptr, this.layout)
+    }
+
     /// Move a plugin's value into a host buffer (bitwise, like any Rust move).
     ///
     /// # Safety
     /// `src` must point to `size` readable bytes of a value the caller gives
     /// up ownership of; `drop_fn` and `to_dyn` must stay callable until the
-    /// value is delivered or dropped.
+    /// value is delivered or dropped. `buffer` must be a live allocation of
+    /// exactly this `(size, align)` layout whose contents were already
+    /// dropped, or `None` to allocate.
     pub(crate) unsafe fn from_foreign(
         src: *const u8,
         size: usize,
         align: usize,
         drop_fn: Option<RawDropFn>,
         to_dyn: Option<RawToDynFn>,
+        buffer: Option<NonNull<u8>>,
     ) -> Option<Self> {
         let layout = Layout::from_size_align(size, align).ok()?;
-        let ptr = Self::alloc(layout);
+        let ptr = match buffer {
+            Some(p) if layout.size() != 0 => p,
+            _ => Self::alloc(layout),
+        };
         if size != 0 {
             // SAFETY: caller guarantees `size` readable bytes; `ptr` has room.
             unsafe { std::ptr::copy_nonoverlapping(src, ptr.as_ptr(), size) };
@@ -530,6 +605,8 @@ pub(crate) struct Core<H: ?Sized + Slot> {
     batch_scratch: H::Mutex<Vec<(u64, Queued)>>,
     /// Stamps every queued event with its publish sequence.
     next_seq: AtomicU64,
+    /// Recycled payload buffers (typed layouts and dynamic field buffers).
+    pools: H::Mutex<Pools>,
     registry: H::Lock<Registry>,
     next_token: AtomicU64,
     flushing: AtomicBool,
@@ -568,6 +645,130 @@ fn queue_shard(channel: Channel) -> usize {
 #[derive(Default)]
 struct Shard(VecDeque<(u64, Queued)>);
 
+// ---------------------------------------------------------------------------
+// Payload pools
+// ---------------------------------------------------------------------------
+
+/// Recycled payloads: typed event buffers keyed by `(size, align)` and the
+/// field buffers of dynamic events. Delivery round-trips pool to pool (see
+/// `dispatch_owned` / `drain`), so a full pipeline stop hits nothing rather
+/// than a new buffer transaction.
+///
+/// Caps bound the memory a busy pipeline can hold: pooled buffers past a cap
+/// are dropped rather than stored. Buffers are deallocated (contents were
+/// dropped at harvest time) with the core.
+pub(crate) struct Pools {
+    /// Typed payload buffers by `(size, align)`; each buffer holds no value
+    /// (its contents were dropped before pooling).
+    buffers: FxHashMap<(usize, usize), Vec<NonNull<u8>>>,
+    buffers_len: usize,
+    buffers_cap: usize,
+    /// Fields vectors of dynamic events (`DynEvent::fields`).
+    fields: Vec<Vec<crate::DynValue>>,
+    /// `DynValue::Str` buffers, seeded from delivered events.
+    strings: Vec<String>,
+    /// `DynValue::Bytes` buffers.
+    bytes: Vec<Vec<u8>>,
+    dyn_cap: usize,
+}
+
+impl Pools {
+    fn new(buffers_cap: usize, dyn_cap: usize) -> Self {
+        Self {
+            buffers: FxHashMap::default(),
+            buffers_len: 0,
+            buffers_cap,
+            fields: Vec::new(),
+            strings: Vec::new(),
+            bytes: Vec::new(),
+            dyn_cap,
+        }
+    }
+
+    /// A typed payload buffer of exactly this layout; `None` empties it.
+    pub(crate) fn take_buffer(&mut self, layout: &Layout) -> Option<NonNull<u8>> {
+        if layout.size() == 0 {
+            return None;
+        }
+        let key = (layout.size(), layout.align());
+        match self.buffers.get_mut(&key).and_then(Vec::pop) {
+            Some(p) => {
+                self.buffers_len -= 1;
+                Some(p)
+            }
+            None => None,
+        }
+    }
+
+    /// Recycle a typed payload buffer (contents were dropped by the caller).
+    pub(crate) fn put_buffer(&mut self, ptr: NonNull<u8>, layout: Layout) {
+        if layout.size() == 0 || self.buffers_len >= self.buffers_cap {
+            return;
+        }
+        self.buffers
+            .entry((layout.size(), layout.align()))
+            .or_default()
+            .push(ptr);
+        self.buffers_len += 1;
+    }
+
+    pub(crate) fn take_fields(&mut self) -> Vec<crate::DynValue> {
+        self.fields.pop().unwrap_or_default()
+    }
+
+    /// Recycle the fields vector; already emptied before being offered here.
+    pub(crate) fn put_fields(&mut self, buf: Vec<crate::DynValue>) {
+        if self.fields.len() < self.dyn_cap {
+            self.fields.push(buf);
+        }
+    }
+
+    pub(crate) fn put_string(&mut self, s: String) {
+        if self.strings.len() < self.dyn_cap {
+            self.strings.push(s);
+        }
+    }
+
+    pub(crate) fn put_bytes(&mut self, b: Vec<u8>) {
+        if self.bytes.len() < self.dyn_cap {
+            self.bytes.push(b);
+        }
+    }
+
+    /// Recycle a delivered dynamic event: `Str`/`Bytes` buffers split out,
+    /// the `fields` vector emptied in place and reused.
+    pub(crate) fn put_dyn_fields(&mut self, mut fields: Vec<crate::DynValue>) {
+        for v in fields.drain(..) {
+            match v {
+                DynValue::Str(s) => self.put_string(s),
+                DynValue::Bytes(b) => self.put_bytes(b),
+                _ => drop(v),
+            }
+        }
+        self.put_fields(fields);
+    }
+}
+
+// SAFETY: a pool is only reachable through its core's lock, and its raw
+// buffers are owned by exactly one pool (as documented on `put_buffer`).
+// The same thread-boundary promise the buffers' live values carry as
+// `OwnedTyped` applies here.
+unsafe impl Send for Pools {}
+
+impl Drop for Pools {
+    fn drop(&mut self) {
+        for (key, buf) in self.buffers.drain() {
+            let layout = std::alloc::Layout::from_size_align(key.0, key.1).expect("pooled layout");
+            for p in buf {
+                // SAFETY: buffers pooled here were allocated with this layout.
+                unsafe {
+                    std::alloc::dealloc(p.as_ptr(), layout);
+                }
+            }
+        }
+    }
+}
+
 impl<H: ?Sized + Slot> Core<H> {
     pub(crate) fn new() -> Self {
         Self {
@@ -578,6 +779,7 @@ impl<H: ?Sized + Slot> Core<H> {
             queue: std::array::from_fn(|_| Lock::new(Shard::default())),
             batch_scratch: Lock::new(Vec::new()),
             next_seq: AtomicU64::new(0),
+            pools: Lock::new(Pools::new(DEFAULT_POOL_BUFFERS_CAP, DEFAULT_POOL_DYN_CAP)),
             registry: Lock::new(Registry::default()),
             next_token: AtomicU64::new(1),
             flushing: AtomicBool::new(false),
@@ -714,20 +916,123 @@ impl<H: ?Sized + Slot> Core<H> {
         }
     }
 
-    fn dispatch_owned(&self, q: &Queued) {
-        match &q.payload {
-            OwnedPayload::Typed { id, value } => self.dispatch(*id, q.channel, || {
-                EventView::raw_typed(
-                    *id,
-                    q.channel,
-                    value.ptr.as_ptr(),
-                    value.layout.size(),
-                    value.layout.align(),
-                    &value.to_dyn,
-                )
-            }),
+    /// The dynamic form of a queued typed payload, written into pooled
+    /// buffers so delivering to dynamic subscribers allocates nothing once
+    /// the pool is primed (first use allocates, later events reuse the
+    /// buffers the previous event returned).
+    ///
+    /// Shared as an `Arc` so the flush can recycle its buffers only after
+    /// the subscribers have run.
+    fn build_pooled_dyn(&self, event: &OwnedTyped) -> Option<Arc<DynEvent>> {
+        let mut sink = self.pools.write(|p| {
+            let mut sink = DynEventSink::empty();
+            sink.give_fields(p.take_fields());
+            sink.give_spares(std::mem::take(&mut p.strings), std::mem::take(&mut p.bytes));
+            sink
+        });
+        // SAFETY: `ptr` is the live value `OwnedTyped` holds until delivery;
+        // the thunk is the one built for its exact type.
+        let ok = unsafe {
+            match &event.to_dyn {
+                ToDyn::Local(f) => f(event.ptr.as_ptr(), &mut sink),
+                _ => false,
+            }
+        };
+        let (event_dyn, spares) = sink.finish();
+        self.put_spares(spares);
+        if ok {
+            event_dyn.map(Arc::new)
+        } else {
+            None
+        }
+    }
+
+    /// Unused sink buffers return to the pool.
+    fn put_spares(&self, spares: SinkSpares) {
+        self.pools.write(|p| {
+            p.strings = spares.strings;
+            p.bytes = spares.bytes;
+            p.strings.truncate(p.dyn_cap);
+            p.bytes.truncate(p.dyn_cap);
+        });
+    }
+
+    /// Return a delivered queued event's buffers to the pools. Contents are
+    /// dropped first (the drop-once delivery contract), the memory is kept.
+    #[inline]
+    fn recycle_queued(&self, q: Queued) {
+        match q.payload {
+            OwnedPayload::Typed { value, .. } => {
+                // SAFETY: the buffer is dropped here exactly once and pooled
+                // (or handed to the allocator) right after; never reused while
+                // drop_fn runs.
+                let (ptr, layout) = unsafe { value.drop_contents_keep_buffer() };
+                self.pools.write(|p| p.put_buffer(ptr, layout));
+            }
             OwnedPayload::Dyn(d) => {
-                self.dispatch(d.id, q.channel, || EventView::dynamic(q.channel, d))
+                self.pools.write(|p| p.put_dyn_fields(d.fields));
+            }
+        }
+    }
+
+    pub(crate) fn dispatch_owned(&self, q: &Queued) {
+        let mut prebuilt: Option<Arc<DynEvent>> = None;
+        {
+            let view = match &q.payload {
+                OwnedPayload::Typed { id, value } => {
+                    // Dynamic subscribers in this channel's list get the
+                    // pooled dynamic form up front; dispatch never converts
+                    // lazily.
+                    if let Some(list) = self.snapshot((*id, q.channel)) {
+                        if list.iter().any(|e| e.handler.is_dyn()) {
+                            prebuilt = self.build_pooled_dyn(value);
+                        }
+                    }
+                    let view = self.make_typed_view(*id, q.channel, value);
+                    if let Some(f) = &prebuilt {
+                        let _ = view.dyn_form.set(Arc::clone(f));
+                    }
+                    view
+                }
+                OwnedPayload::Dyn(d) => EventView::dynamic(q.channel, d),
+            };
+            self.run_dispatch(view);
+        } // the view (and its Arc clone) drop here
+        // Handlers are done; the pooled dynamic form's buffers go back.
+        self.harvest_prebuilt(&mut prebuilt);
+    }
+
+    fn make_typed_view<'a>(
+        &self,
+        id: u64,
+        channel: Channel,
+        value: &'a OwnedTyped,
+    ) -> EventView<'a> {
+        EventView::raw_typed(
+            id,
+            channel,
+            value.ptr.as_ptr(),
+            value.layout.size(),
+            value.layout.align(),
+            &value.to_dyn,
+        )
+    }
+
+    fn run_dispatch(&self, ev: EventView<'_>) {
+        if let Some(list) = self.snapshot((ev.id, ev.channel)) {
+            for e in list.iter() {
+                if e.alive.load(Ordering::Acquire) {
+                    e.handler.deliver(&ev);
+                }
+            }
+        }
+    }
+
+    /// Handlers are done; the pooled dynamic form's buffers go back.
+    fn harvest_prebuilt(&self, prebuilt: &mut Option<Arc<DynEvent>>) {
+        if let Some(arc) = prebuilt.take() {
+            if let Ok(ev) = Arc::try_unwrap(arc) {
+                self.pools.write(|p| p.put_dyn_fields(ev.fields));
             }
         }
     }
@@ -818,13 +1123,44 @@ impl<H: ?Sized + Slot> Core<H> {
             });
             report.rounds += 1;
             for (_, event) in merged.drain(..) {
-                // Dropped right after its delivery, like the single queue.
+                // Delivered now; its buffers go to the pools right after.
                 self.dispatch_owned(&event);
-                drop(event);
+                self.recycle_queued(event);
                 report.delivered += 1;
             }
             self.batch_scratch.write(|batch| *batch = merged);
         }
+    }
+
+    // --- payload pools ---------------------------------------------------
+
+    /// A pooled buffer matching `layout`, or `None` (allocate fresh).
+    pub(crate) fn take_buffer(&self, layout: &Layout) -> Option<NonNull<u8>> {
+        self.pools.write(|p| p.take_buffer(layout))
+    }
+
+    /// Overrides for the pool caps (tests/tools); excess buffers are
+    /// dropped at the next harvest.
+    pub(crate) fn set_pool_caps(&self, buffers: usize, dyn_cap: usize) {
+        self.pools.write(|p| {
+            p.buffers_cap = buffers;
+            p.dyn_cap = dyn_cap;
+            p.fields.truncate(dyn_cap);
+            p.strings.truncate(dyn_cap);
+            p.bytes.truncate(dyn_cap);
+        });
+    }
+
+    /// (buffers in pool, fields vecs, strings, bytes) — diagnostics.
+    pub(crate) fn pool_sizes(&self) -> (usize, usize, usize, usize) {
+        self.pools.write(|p| {
+            (
+                p.buffers_len,
+                p.fields.len(),
+                p.strings.len(),
+                p.bytes.len(),
+            )
+        })
     }
 
     // --- registry --------------------------------------------------------

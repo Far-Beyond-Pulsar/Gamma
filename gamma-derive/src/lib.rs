@@ -264,6 +264,12 @@ fn generate_event_impl(
                 ))
             }
 
+            fn to_dyn_into(&self, sink: &mut #krate::DynEventSink) -> bool {
+                sink.id = <Self as #krate::Event>::stable_type_id();
+                #( #krate::DynField::to_dyn_into(&self.#accessors, sink); )*
+                true
+            }
+
             fn from_dyn(event: &#krate::DynEvent) -> ::core::option::Option<Self> {
                 if event.id != <Self as #krate::Event>::stable_type_id() || event.fields.len() != #count {
                     return ::core::option::Option::None;
